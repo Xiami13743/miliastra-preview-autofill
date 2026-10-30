@@ -7,3 +7,6 @@ __pycache__/
 !模板/
 !模板/*.xlsx
 *.zip
+build/
+dist/
+*.spec

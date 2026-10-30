@@ -167,6 +167,57 @@ class DataTests(unittest.TestCase):
             self.assertEqual(set(data['name']), set(tool.LANGS))
             self.assertEqual(data['name'][tool.LANGS[-1]], 'Example 2')
 
+    def test_missing_calibration_gives_actionable_prompt_before_game_access(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as folder:
+            for probe in (False, True):
+                app = Mock(busy=False, calib=None)
+                app.tr = lambda cn, en: cn
+                with patch.object(tool, 'CALIB_FILE', str(Path(folder) / 'not-created.json')):
+                    tool.App.start(app, probe=probe)
+                app.game.assert_not_called()
+                app.error.assert_called_once()
+                message = str(app.error.call_args.args[0])
+                self.assertIn('③', message)
+                self.assertNotIn('No such file', message)
+
+    def test_frozen_application_file_uses_exe_not_internal_source(self):
+        executable = str(Path(tempfile.gettempdir()) / '便携工具' / '工具.exe')
+        with patch.object(tool.sys, 'frozen', True, create=True), patch.object(tool.sys, 'executable', executable):
+            self.assertEqual(tool.application_file(), Path(executable).resolve())
+        with patch.object(tool.sys, 'frozen', False, create=True):
+            self.assertEqual(tool.application_file(), Path(tool.__file__).resolve())
+
+    def test_elevation_relaunch_arguments_for_source_and_frozen(self):
+        from unittest.mock import Mock
+        for frozen, expected in ((False, ['tool.py', '带 空格']), (True, ['带 空格'])):
+            with self.subTest(frozen=frozen):
+                run = Mock(return_value=33)
+                with patch.object(tool.sys, 'frozen', frozen, create=True), \
+                     patch.object(tool.sys, 'argv', ['tool.py', '带 空格']), \
+                     patch.object(tool, '_api', side_effect=[lambda: False, run]):
+                    with self.assertRaises(SystemExit) as result:
+                        tool.elevate()
+                self.assertEqual(result.exception.code, 0)
+                self.assertEqual(run.call_args.args[3], tool.subprocess.list2cmdline(expected))
+                self.assertEqual(run.call_args.args[4], str(tool.APP_DIR))
+
+    def test_empty_history_does_not_read_following_metadata(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / 'template.xlsx'
+            tool.write_template(source)
+            cells = {(1, 2): '简体中文', (16, 1): '版本更新记录',
+                     (17, 1): '说明：可留空', (19, 1): '关卡标签',
+                     (20, 1): '控制设备', (20, 2): '键盘鼠标、触屏、手柄'}
+            ws = tool._Worksheet('Sheet1', cells, 20, 2)
+            with patch.object(tool, '_read_worksheet', return_value=ws):
+                data = tool.read_table(source, log=lambda _: None)
+            self.assertEqual(data['version'], {})
+            cells[(18, 2)] = '实际更新说明'
+            with patch.object(tool, '_read_worksheet', return_value=ws):
+                data = tool.read_table(source, log=lambda _: None)
+            self.assertEqual(data['version'][tool.LANGS[0]], '实际更新说明')
+
     def test_clipboard_uses_full_width_pointer_and_transfers_ownership(self):
         text = '中文 한국어 日本語 😀'
         buffer = ctypes.create_string_buffer(1024)

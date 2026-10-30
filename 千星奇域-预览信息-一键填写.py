@@ -18,11 +18,18 @@ import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.3.6"
 APP_TITLE = f"千星奇域-预览信息-一键填写 v{APP_VERSION}"
-CALIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "多语言填选-calib.json")
-CALIB_DRAFT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "多语言填选-calib-draft.json")
-MEDIA_CALIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "多语言填选-media-calib.json")
+
+
+def application_file():
+    return Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
+
+
+APP_DIR = application_file().parent
+CALIB_FILE = str(APP_DIR / "多语言填选-calib.json")
+CALIB_DRAFT_FILE = str(APP_DIR / "多语言填选-calib-draft.json")
+MEDIA_CALIB_FILE = str(APP_DIR / "多语言填选-media-calib.json")
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
@@ -134,7 +141,8 @@ def elevate():
         return
     run = _api(shell32, "ShellExecuteW", [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR,
                                          wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_int], ctypes.c_ssize_t)
-    rc = run(None, "runas", sys.executable, subprocess.list2cmdline(sys.argv), os.getcwd(), 1)
+    args = sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv
+    rc = run(None, "runas", sys.executable, subprocess.list2cmdline(args), str(APP_DIR), 1)
     sys.exit(0 if rc > 32 else 1)
 
 
@@ -667,11 +675,19 @@ def read_table(path, sheet=None, log=print):
             if k not in label_row:
                 continue
             r0 = label_row[k]
+            # Keep legacy below-label text, but never cross a new section heading.
+            end = min(r0 + 7, ws.max_row + 1,
+                      min((n for n in label_row.values() if n > r0), default=ws.max_row + 1))
+            for r in range(r0 + 1, end):
+                label = ws.cell(r, 1)
+                if isinstance(label, str) and label.strip() and not label.strip().startswith(("说明：", "说明:", "Instructions:")):
+                    end = r
+                    break
             for lang in LANGS:
                 col = lang_col.get(lang)
                 if not col:
                     continue
-                for r in range(r0, min(r0 + 7, ws.max_row + 1, min((n for n in label_row.values() if n > r0), default=ws.max_row + 1))):
+                for r in range(r0, end):
                     v = ws.cell(r, col)
                     if isinstance(v, str) and v.strip():
                         out[k][lang] = v.strip()
@@ -1445,8 +1461,8 @@ class App:
         self.widget(ttk.Checkbutton, self.root, "共用弹窗位置（千星，精简校准）", "Shared dialog positions (Miliastra, fewer steps)", variable=self.shared_dialog).pack(anchor="w", padx=10)
         self.logbox = tk.Text(self.root, height=18, wrap="word", state="disabled")
         self.logbox.pack(fill="both", expand=True, **pad)
-        self.log(self.tr(f"当前版本：v{APP_VERSION}（媒体功能测试中）", f"Version: v{APP_VERSION} (media feature in testing)"))
-        self.log(self.tr("运行文件：", "Running file: ") + os.path.abspath(__file__))
+        self.log(self.tr(f"当前版本：v{APP_VERSION}", f"Version: v{APP_VERSION}"))
+        self.log(self.tr("运行文件：", "Running file: ") + str(application_file()))
         self.log(self.tr("进程号：", "Process ID: ") + str(os.getpid()))
         self.log(self.tr("先点 ① 选表；然后按 ②③④⑤ 的顺序来。最终提交由你确认。", "Choose Excel with ①, then follow ②③④⑤. Review the result and submit it yourself."))
 
@@ -1570,11 +1586,16 @@ class App:
         if self.busy:
             return
         try:
-            hwnd = self.game()
             if self.calib is None:
-                with open(CALIB_FILE, encoding="utf-8") as stream:
-                    self.calib = json.load(stream)
+                try:
+                    with open(CALIB_FILE, encoding="utf-8") as stream:
+                        self.calib = json.load(stream)
+                except FileNotFoundError as exc:
+                    raise ValueError(self.tr("还没有校准数据。请先点③完成校准，再使用④或⑤。也可以把旧版的「多语言填选-calib.json」复制到当前 exe 旁边。", "No calibration yet. Complete ③ before using ④ or ⑤, or copy your previous 多语言填选-calib.json next to this exe.")) from exc
+                except (ValueError, UnicodeError) as exc:
+                    raise ValueError(self.tr("校准文件无法读取，请点③重新校准。", "The calibration file is invalid. Use ③ to calibrate again.")) from exc
             validate_calibration(self.calib)
+            hwnd = self.game()
             self.log_geometry(hwnd)
             texts = read_table(self.path.get(), self.sheet.get(), log=lambda _: None)
             plan = build_plan(texts, [l for l in LANGS if self.lang_vars[l].get()], [k for k, _ in FIELDS if self.field_vars[k].get()])
@@ -1634,11 +1655,44 @@ class App:
 
 
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--self-test":
+        portable_self_test(Path(sys.argv[2]))
+        return
     elevate()
     enable_physical_pixels()
     root = tk.Tk()
     App(root)
     root.mainloop()
+
+
+def portable_self_test(report_path):
+    """Exercise the packaged Tk/runtime without elevation or game input."""
+    import tempfile
+    report = {"version": APP_VERSION, "frozen": bool(getattr(sys, "frozen", False))}
+    root = None
+    try:
+        enable_physical_pixels()
+        root = tk.Tk()
+        root.withdraw()
+        app = App(root)
+        root.update()
+        report["tk"] = root.tk.call("info", "patchlevel")
+        report["dpi_aware"] = True
+        report["calibration_next_to_app"] = Path(CALIB_FILE).parent == application_file().parent
+        with tempfile.TemporaryDirectory(prefix="preview-autofill-selftest-") as temp:
+            template = Path(temp) / "空白模板.xlsx"
+            write_template(template)
+            data = read_table(template, log=lambda _: None)
+            report["template_roundtrip"] = all(LANGS[0] in data[key] for key, _ in FIELDS)
+        report["ok"] = all(report[k] for k in ("dpi_aware", "calibration_next_to_app", "template_roundtrip"))
+    except Exception as exc:
+        report.update(ok=False, error=str(exc))
+    finally:
+        if root is not None:
+            root.destroy()
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    if not report["ok"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

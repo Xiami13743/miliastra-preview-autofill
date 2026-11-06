@@ -344,10 +344,11 @@ class MediaWizardTests(unittest.TestCase):
                 wizard.close()
                 wizard = tool.MediaCalibrationWizard(app, 42, [('cover', 0, 'x.png'), ('image', 0, 'a.png'), ('image', 1, 'b.png'), ('video', 0, 'v.mp4')])
                 self.assertEqual([s[0] for s in wizard.steps], ['cover', 'image_first', 'image_next', 'video'])
+                image_preset = wizard.captured['image_first']
                 wizard.captured['cover'] = (.3, .4)
                 wizard.go(1); wizard.capture(); generation = wizard.generation
                 wizard.go(0); wizard.countdown(0, 1, generation)
-                self.assertNotIn('image_first', wizard.captured)
+                self.assertEqual(wizard.captured['image_first'], image_preset)
                 wizard.close()
                 panel = tool.MediaPanel(app)
                 app.media_panel = panel

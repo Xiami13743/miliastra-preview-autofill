@@ -81,6 +81,40 @@ class FillTests(unittest.TestCase):
         self.assertAlmostEqual(rows[1], .4)
         self.assertIn(("click", (.3, .7)), self.events)
 
+    def test_english_default_pastes_each_translation_into_its_in_game_row(self):
+        c = calibration()
+        c["first_language"] = "English"
+        names = {"简体中文": "Simplified", "English": "English", "繁體中文": "Traditional", "Tiếng Việt": "Vietnamese"}
+        plan = tool.build_plan({"name": names}, names, ["name"], "English")
+        pages = []
+        tool.do_fill(plan, c, 42, self.logs.append, tr=lambda cn, en: en,
+                     confirm_page=lambda page: pages.append(page) or True)
+        self.assertEqual(pages, ["top", "bottom"])
+        self.assertEqual([value for event, value in self.events if event == "clipboard"],
+                         ["English", "Simplified", "Traditional", "Vietnamese"])
+        clicks = [point for event, point in self.events if event == "click"]
+        self.assertEqual([round(y, 2) for _, y in clicks], [.2, .26, .32, .4])
+        self.assertTrue(any("English · Stage Name" in entry for entry in self.logs))
+
+    def test_mismatched_language_plan_stops_before_input(self):
+        c = calibration()
+        c["first_language"] = "English"
+        plan = tool.build_plan({"name": {"简体中文": "test"}}, ["简体中文"], ["name"])
+        with self.assertRaises(tool.CalibrationError):
+            tool.do_fill(plan, c, 42, self.logs.append, confirm_page=lambda _: True)
+        self.assertEqual(self.events, [])
+
+    def test_default_from_lower_page_moves_thai_to_the_bottom_anchor(self):
+        c = calibration()
+        c["first_language"] = "Deutsch"
+        names = {"Deutsch": "German", "ภาษาไทย": "Thai", "Tiếng Việt": "Vietnamese"}
+        plan = tool.build_plan({"name": names}, names, ["name"], "Deutsch")
+        tool.do_fill(plan, c, 42, self.logs.append, confirm_page=lambda _: True)
+        self.assertEqual([value for event, value in self.events if event == "clipboard"],
+                         ["German", "Thai", "Vietnamese"])
+        self.assertEqual([round(point[1], 2) for event, point in self.events if event == "click"],
+                         [.2, .4, .46])
+
     def test_version_dropdown_and_option_shared_across_languages(self):
         c = calibration()
         c['version_selector'] = {'dropdown': [.5, .3], 'option': [.5, .35]}
@@ -113,6 +147,40 @@ class FillTests(unittest.TestCase):
 
 
 class DataTests(unittest.TestCase):
+    def test_game_window_detection_uses_english_title_and_game_process(self):
+        def detect(title, image):
+            windows = {41: ("Genshin Impact", "browser.exe"), 42: (title, image)}
+
+            def get_title(hwnd, buffer, size):
+                buffer.value = windows[hwnd][0]
+                return len(buffer.value)
+
+            def get_rect(hwnd, pointer):
+                rect = ctypes.cast(pointer, ctypes.POINTER(tool.wintypes.RECT)).contents
+                rect.right = 1920 if hwnd == 41 else 1280
+                rect.bottom = 1080 if hwnd == 41 else 720
+                return True
+
+            def enumerate_windows(callback, _):
+                for hwnd in windows:
+                    callback(hwnd, 0)
+                return True
+
+            with patch.object(tool.user32, "EnumWindows", side_effect=enumerate_windows), \
+                 patch.object(tool.user32, "IsWindowVisible", return_value=True), \
+                 patch.object(tool.user32, "GetWindowTextLengthW", side_effect=lambda hwnd: len(windows[hwnd][0])), \
+                 patch.object(tool.user32, "GetWindowTextW", side_effect=get_title), \
+                 patch.object(tool.user32, "GetClientRect", side_effect=get_rect), \
+                 patch.object(tool, "window_class", return_value="UnityWndClass"), \
+                 patch.object(tool, "window_pid", side_effect=lambda hwnd: hwnd), \
+                 patch.object(tool, "process_image_name", side_effect=lambda pid: windows[pid][1]):
+                return tool.find_game_window()
+
+        self.assertEqual(detect("Genshin Impact", "genshinimpact.exe"), 42)
+        self.assertEqual(detect("Genshin Impact", None), 42)
+        self.assertEqual(detect("原神", "yuanshen.exe"), 42)
+        self.assertIsNone(detect("Browser — Genshin Impact", "browser.exe"))
+
     def test_shared_calibration_reduces_points_and_preserves_full_mode(self):
         self.assertEqual(len(tool.calibration_steps(True)), 9)
         self.assertEqual(len(tool.calibration_steps(False)), 13)
@@ -126,6 +194,9 @@ class DataTests(unittest.TestCase):
         self.assertEqual(result['dialogs']['notes'], result['dialogs']['version'])
         self.assertEqual(result['version_selector']['option'], [.5, .35])
         self.assertEqual(result['scale'], 1.5)
+        english = tool.calibration_steps(True, first_language="English")
+        self.assertIn("center of the Stage Name cell in the first row (English)", english[0][2])
+        self.assertIn("second row (简体中文)", english[1][2])
 
     def test_coordinates_at_physical_resolutions_and_dpi(self):
         for size in ((962, 564), (1920, 1080), (2560, 1440)):
@@ -143,7 +214,9 @@ class DataTests(unittest.TestCase):
             for english in (False, True):
                 tool.write_template(source, english=english)
                 data = tool.read_table(source, log=lambda _: None)
-                self.assertTrue(all(tool.LANGS[0] in data[key] for key, _ in tool.FIELDS))
+                example_language = "English" if english else "简体中文"
+                self.assertTrue(all(set(data[key]) == {example_language} for key, _ in tool.FIELDS))
+            self.assertEqual(tool._xlsx_sheets(source), ["Stage Info"])
             with zipfile.ZipFile(source) as book:
                 parts = {n: book.read(n) for n in book.namelist()}
             root = ET.fromstring(parts['xl/worksheets/sheet1.xml'])
@@ -167,19 +240,49 @@ class DataTests(unittest.TestCase):
             self.assertEqual(set(data['name']), set(tool.LANGS))
             self.assertEqual(data['name'][tool.LANGS[-1]], 'Example 2')
 
-    def test_missing_calibration_gives_actionable_prompt_before_game_access(self):
+    def test_missing_presets_and_calibration_prompt_before_game_access(self):
         from unittest.mock import Mock
         with tempfile.TemporaryDirectory() as folder:
             for probe in (False, True):
-                app = Mock(busy=False, calib=None)
+                app = Mock(busy=False)
+                app.first_language.get.return_value = "简体中文"
                 app.tr = lambda cn, en: cn
-                with patch.object(tool, 'CALIB_FILE', str(Path(folder) / 'not-created.json')):
+                with patch.object(tool, 'CALIB_FILE', str(Path(folder) / 'not-created.json')), \
+                     patch.object(tool, 'PRESET_DIR', Path(folder)):
                     tool.App.start(app, probe=probe)
                 app.game.assert_not_called()
                 app.error.assert_called_once()
                 message = str(app.error.call_args.args[0])
                 self.assertIn('③', message)
                 self.assertNotIn('No such file', message)
+
+    def test_english_first_reuses_saved_coordinates(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "text-calib.json"
+            original = calibration()
+            path.write_text(json.dumps(original), encoding="utf-8")
+            with patch.object(tool, "CALIB_FILE", str(path)):
+                english, from_preset = tool.load_text_calibration("English")
+            self.assertFalse(from_preset)
+            self.assertEqual(english["top"], original["top"])
+            self.assertEqual(tool.validate_calibration(english)[:3], ("English", "简体中文", "繁體中文"))
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), original)
+
+    def test_clean_install_has_text_and_media_positions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            with patch.object(tool, "CALIB_FILE", str(folder / "new-calib.json")):
+                text_preset, text_from_preset = tool.load_text_calibration("English")
+            media_preset, media_from_preset = tool.load_calibration("media.json", folder / "new-media.json")
+            self.assertTrue(text_from_preset and media_from_preset)
+            self.assertIn("version_selector", text_preset)
+            self.assertEqual(tool.validate_calibration(text_preset)[0], "English")
+            tool.validate_media_calibration(media_preset, [("cover", 0, ""), ("image", 3, ""), ("video", 0, "")])
+            tool.check_preset_size(text_preset, (2560, 1440), lambda cn, en: en)
+            with self.assertRaisesRegex(ValueError, "16:9"):
+                tool.check_preset_size(text_preset, (1600, 1200), lambda cn, en: en)
 
     def test_frozen_application_file_uses_exe_not_internal_source(self):
         executable = str(Path(tempfile.gettempdir()) / '便携工具' / '工具.exe')

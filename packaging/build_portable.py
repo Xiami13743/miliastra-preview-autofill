@@ -35,8 +35,15 @@ def main():
                     '--noupx', '--name', NAME, '--manifest', str(ROOT / 'packaging/windows.manifest'),
                     '--distpath', str(output), '--workpath', str(work / 'pyinstaller'),
                     '--specpath', str(work), str(source)], check=True)
-    for file in ('README.md', 'LICENSE', 'CHANGELOG.md'):
+    for file in ('README.md', 'README.en.md', 'LICENSE', 'CHANGELOG.md'):
         shutil.copy2(ROOT / file, package / file)
+    (package / 'assets').mkdir()
+    for file in ('readme-zh.svg', 'readme-en.svg'):
+        shutil.copy2(ROOT / 'assets' / file, package / 'assets' / file)
+    presets = package / '_internal' / 'presets'
+    presets.mkdir()
+    for file in ('text.json', 'media.json'):
+        shutil.copy2(ROOT / 'presets' / file, presets / file)
     (package / '模板').mkdir()
     shutil.copy2(ROOT / '模板/多语言填写模板.xlsx', package / '模板/多语言填写模板.xlsx')
     (package / '使用说明.txt').write_text(
@@ -45,13 +52,16 @@ def main():
         '3. 首次启动如弹出管理员权限提示，请选择“是”。\n'
         '4. 不需要安装 Python、Excel 或其他运行库。\n\n'
         '请保留 _internal 文件夹，不能只复制 exe。\n'
-        '校准文件保存在 exe 旁边。更新前保留你自己的三个 calib JSON 文件。\n'
-        '完整步骤见 README.md。F9 随时停止，游戏最终“提交”由你手动点击。\n'
-        '本版本已由使用者真机测试通过；使用前仍请在自己的游戏中核对位置。\n', encoding='utf-8-sig')
+        '程序内置 v0.3.6 的文字和媒体坐标，可先核对位置。\n'
+        '校准文件保存在 exe 旁边。更新前请保留自己的 calib JSON 文件。\n'
+        '完整步骤见 README.md。F9 随时停止，游戏最终“提交”由你手动点击。\n\n'
+        'English setup guide: README.en.md\n', encoding='utf-8-sig')
     authorized_calibration = set()
     if args.calibration_dir:
         details = []
-        for name in ('多语言填选-calib.json', '多语言填选-calib-draft.json', '多语言填选-media-calib.json'):
+        saved_calibrations = ('多语言填选-calib.json', '多语言填选-calib-en.json')
+        for name in (*saved_calibrations, '多语言填选-calib-draft.json',
+                     '多语言填选-calib-draft-en.json', '多语言填选-media-calib.json'):
             original = args.calibration_dir.resolve() / name
             if not original.is_file():
                 continue
@@ -61,7 +71,7 @@ def main():
             shutil.copy2(original, package / name)
             authorized_calibration.add(name)
             details.append(f'{name}：客户区 {data["size"][0]}×{data["size"][1]}，DPI {data["dpi"]}，缩放 {data["dpi"] / 96:.0%}。')
-        if '多语言填选-calib.json' not in authorized_calibration:
+        if not any(name in authorized_calibration for name in saved_calibrations):
             raise ValueError('A saved text calibration is required when --calibration-dir is used')
         (package / '校准说明.txt').write_text('此包经使用者授权，附带其最新校准。\n\n' + '\n'.join(details) +
             '\n\n使用前先点④核对；媒体使用“核对媒体位置”。布局、分辨率或缩放不同时请重新校准。\n'

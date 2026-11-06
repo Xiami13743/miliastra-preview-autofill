@@ -1,5 +1,14 @@
 # 更新记录
 
+## v0.3.7 · 2026-11-06
+
+- 识别 `Genshin Impact` 窗口和 `GenshinImpact.exe` 进程。
+- 选择实际置顶语种后自动换算各行落点，15 种语言共用同一套文字校准。
+- 内置 v0.3.6 的文字、版本下拉及媒体坐标，可直接核对位置。
+- 改写英文使用说明，明确先导出并填好 Excel 模板，以及校准时把鼠标停在目标中心。
+- 英文模板采用 Stage Name、Gameplay Details、Stage Description、Update Log，并把示例放在 English 列。
+- 英文保存按钮标为 OK，界面增加 Language 标签，README 增加中英文导航按钮。
+
 ## v0.3.6 · 2026-10-30
 
 - Windows x64 免安装便携包，解压后双击 exe，无需 Python 或 Excel。

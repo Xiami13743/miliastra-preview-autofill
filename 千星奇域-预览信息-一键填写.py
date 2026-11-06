@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-APP_VERSION = "0.3.6"
+APP_VERSION = "0.3.7"
 APP_TITLE = f"千星奇域-预览信息-一键填写 v{APP_VERSION}"
 
 
@@ -27,6 +27,7 @@ def application_file():
 
 
 APP_DIR = application_file().parent
+PRESET_DIR = Path(__file__).resolve().parent / "presets"
 CALIB_FILE = str(APP_DIR / "多语言填选-calib.json")
 CALIB_DRAFT_FILE = str(APP_DIR / "多语言填选-calib-draft.json")
 MEDIA_CALIB_FILE = str(APP_DIR / "多语言填选-media-calib.json")
@@ -81,6 +82,9 @@ _api(user32, "IsClipboardFormatAvailable", [wintypes.UINT], wintypes.BOOL)
 _api(user32, "GetClipboardData", [wintypes.UINT], wintypes.HANDLE)
 _api(shell32, "DragQueryFileW", [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT], wintypes.UINT)
 _api(user32, "GetWindowThreadProcessId", [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)], wintypes.DWORD)
+_api(kernel32, "OpenProcess", [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE)
+_api(kernel32, "QueryFullProcessImageNameW", [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL)
+_api(kernel32, "CloseHandle", [wintypes.HANDLE], wintypes.BOOL)
 _api(user32, "GetClassNameW", [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int], ctypes.c_int)
 _api(user32, "GetDlgCtrlID", [wintypes.HWND], ctypes.c_int)
 _api(user32, "EnumChildWindows", [wintypes.HWND, ENUMPROC, wintypes.LPARAM], wintypes.BOOL)
@@ -146,20 +150,42 @@ def elevate():
     sys.exit(0 if rc > 32 else 1)
 
 
-def find_game_window(keyword="原神"):
+def process_image_name(pid):
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        path = ctypes.create_unicode_buffer(32768)
+        length = wintypes.DWORD(len(path))
+        if kernel32.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(length)):
+            return Path(path.value).name.casefold()
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def find_game_window():
     found = []
+
     @ENUMPROC
     def cb(hwnd, _):
-        if user32.IsWindowVisible(hwnd):
-            buf = ctypes.create_unicode_buffer(user32.GetWindowTextLengthW(hwnd) + 1)
-            user32.GetWindowTextW(hwnd, buf, len(buf))
-            if keyword in buf.value:
-                rect = wintypes.RECT()
-                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                    found.append(((rect.right - rect.left) * (rect.bottom - rect.top), hwnd))
+        length = user32.GetWindowTextLengthW(hwnd)
+        if not length or not user32.IsWindowVisible(hwnd) or window_class(hwnd) == "#32770":
+            return True
+        title = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title, len(title))
+        known_title = title.value.strip().casefold() in ("原神", "genshin impact")
+        image = process_image_name(window_pid(hwnd))
+        if image not in ("yuanshen.exe", "genshinimpact.exe") and not (image is None and known_title):
+            return True
+        rect = wintypes.RECT()
+        if user32.GetClientRect(hwnd, ctypes.byref(rect)):
+            width, height = rect.right - rect.left, rect.bottom - rect.top
+            if width > 0 and height > 0:
+                found.append((image is not None, known_title, width * height, hwnd))
         return True
+
     user32.EnumWindows(cb, 0)
-    return max(found)[1] if found else None
+    return max(found)[3] if found else None
 
 
 def geometry(hwnd):
@@ -287,9 +313,11 @@ class CalibrationError(ValueError):
         return tr(self.cn, self.en)
 
 
-def validate_row_spacing(page, anchor, row, count, size):
-    cn = "顶部（简体中文→繁體中文）" if page == "top" else "底部（Tiếng Việt→Deutsch）"
-    en = "Top (Simplified → Traditional Chinese)" if page == "top" else "Bottom (Vietnamese → German)"
+def validate_row_spacing(page, anchor, row, count, size, first_language="简体中文"):
+    order = stage_language_order(first_language)
+    first, second = order[:2] if page == "top" else order[9:11]
+    cn = f"顶部（{first} → {second}）" if page == "top" else f"底部（{first} → {second}）"
+    en = f"Top ({first} → {second})" if page == "top" else f"Bottom ({first} → {second})"
     height = size[1]
     last = anchor[1] + row * (count - 1)
     if not 0 < row < 1 or not 0 < last < 1:
@@ -301,19 +329,23 @@ def validate_row_spacing(page, anchor, row, count, size):
 
 def validate_calibration(calib):
     if calib.get("schema") != 3:
-        raise CalibrationError("旧版底部行距采集有误。请点③复用已有点，重采Tiếng Việt和Deutsch两点。",
-                               "Legacy bottom spacing used non-adjacent rows. Open ③ to reuse other points and recapture Vietnamese and German.")
+        raise CalibrationError("旧版底部行距需要重采。请点③，按向导采集底部指定的相邻两行。",
+                               "The saved bottom spacing is from an older version. Use ③ and capture the two adjacent rows shown in the wizard.")
+    first_language = calib.get("first_language", "简体中文")
+    order = stage_language_order(first_language)
+
     def point(value):
         if len(value) != 2 or not all(isinstance(n, (int, float)) and 0 < n < 1 for n in value):
             raise ValueError("校准点必须在客户区内 / Calibration point must be inside the client area")
     for page, count in (("top", 9), ("bottom", 6)):
         point(calib[page]["anchor"])
         row = calib[page]["row"]
-        validate_row_spacing(page, calib[page]["anchor"], row, count, calib.get("size", (1, 1)))
+        validate_row_spacing(page, calib[page]["anchor"], row, count, calib.get("size", (1, 1)), first_language)
     ratio = calib["bottom"]["row"] / calib["top"]["row"]
     if not .7 <= ratio <= 1.3:
-        raise CalibrationError("底部与顶部行距相差过大。底部应采Tiếng Việt和紧接着的Deutsch，不能跨到Indonesia。",
-                               "Bottom and top spacing differ too much. Capture Vietnamese and the next German row, not Indonesian.", "bottom_next")
+        first, second = order[9:11]
+        raise CalibrationError(f"底部与顶部行距相差过大。请重采「{first}」和紧接着的「{second}」。",
+                               f"Bottom and top spacing differ too much. Recapture {first} and the {second} row immediately below it.", "bottom_next")
     for key, _ in FIELDS:
         point(calib["cells"][key])
     for key in ("notes", "desc", "version"):
@@ -322,6 +354,7 @@ def validate_calibration(calib):
     if "version_selector" in calib:
         for target in ("dropdown", "option"):
             point(calib["version_selector"][target])
+    return order
 
 
 def cell_point(calib, index, key):
@@ -347,36 +380,51 @@ def checked_cell_point(calib, index, key):
     return point
 
 
-def build_plan(texts, langs, fields):
+def build_plan(texts, langs, fields, first_language="简体中文"):
     return [(i, lang, key, cn, texts[key][lang])
-            for i, lang in enumerate(LANGS) if lang in langs
+            for i, lang in enumerate(stage_language_order(first_language)) if lang in langs
             for key, cn in FIELDS if key in fields and texts.get(key, {}).get(lang)]
 
 
-def calibration_steps(shared_dialog=True, choose_version=False):
+def calibration_steps(shared_dialog=True, choose_version=False, first_language="简体中文"):
+    order = stage_language_order(first_language)
+    first, second = order[:2]
+    bottom_first, bottom_second = order[9:11]
     steps = [
-        ("top", "滚到顶部，将鼠标停在「简体中文 × 关卡名称」中心。", "Scroll to TOP; point at Simplified Chinese × Level name."),
-        ("top_next", "保持面板不动，将鼠标停在「繁體中文 × 关卡名称」中心。", "Do not scroll. Point at 繁體中文 × Level name."),
-        ("notes", "将鼠标停在「简体中文 × 玩法说明」中心。", "Point at Simplified Chinese × Gameplay instructions."),
-        ("desc", "将鼠标停在「简体中文 × 关卡描述」中心。", "Point at Simplified Chinese × Level description."),
-        ("version", "将鼠标停在简体中文版本记录最右侧的小铅笔图标中心，不用点击。", "Point at the rightmost pencil icon for Simplified Chinese version history. Do not click."),
+        ("top", f"把列表滚到最顶部。将鼠标停在第一行「{first}」的「关卡名称」单元格中心。",
+         f"Scroll the language list all the way up. Place the pointer at the center of the Stage Name cell in the first row ({first})."),
+        ("top_next", f"保持列表位置。将鼠标停在紧接着的第二行「{second}」的「关卡名称」单元格中心。",
+         f"Keep the list in place. Place the pointer at the center of the Stage Name cell in the second row ({second}), immediately below the first."),
+        ("notes", f"将鼠标停在第一行「{first}」的「玩法说明」单元格中心。",
+         f"Place the pointer at the center of the Gameplay Details cell in the first row ({first})."),
+        ("desc", f"将鼠标停在第一行「{first}」的「关卡描述」单元格中心。",
+         f"Place the pointer at the center of the Stage Description cell in the first row ({first})."),
+        ("version", f"将鼠标停在第一行「{first}」的「版本更新记录」最右侧铅笔图标中心。",
+         f"Place the pointer at the center of the pencil icon at the right edge of the first row's Update Log cell ({first})."),
     ]
-    dialogs = [("shared", "关卡描述", "Level description")] if shared_dialog else [
-        ("notes", "玩法说明", "Gameplay instructions"), ("desc", "关卡描述", "Level description"), ("version", "版本更新记录", "Version history")]
-    for key, cn, en in dialogs:
-        steps += [(key + "_text", f"手动打开「{cn}」弹窗，将鼠标停在文字输入区内。", f"Manually open {en}; point inside the text area."),
-                  (key + "_confirm", f"保持「{cn}」弹窗打开，将鼠标停在「确认」中心，不用点击。采集后手动关闭弹窗再继续。", f"Keep {en} open; point at Confirm without clicking. Close the dialog manually after capture.")]
+    dialogs = [("shared", "desc")] if shared_dialog else [(key, key) for key in ("notes", "desc", "version")]
+    for key, field in dialogs:
+        cn = dict(FIELDS)[field]
+        en = FIELD_NAMES_EN[field]
+        steps += [(key + "_text", f"手动打开「{cn}」弹窗，将鼠标停在文字输入区内。",
+                   f"Open the {en} editor in the game, then place the pointer inside its text box."),
+                  (key + "_confirm", f"保持「{cn}」弹窗打开，将鼠标停在保存按钮中心。采集后手动关闭弹窗再继续。",
+                   f"With the {en} editor open, place the pointer at the center of the OK button. Close the editor after capture.")]
     if choose_version:
-        steps += [("version_dropdown", "关闭其他弹窗，打开版本更新记录，将鼠标停在版本号下拉按钮中心，不用点击。", "Close other dialogs, open Version history; point at the version dropdown button without clicking."),
-                  ("version_option", "手动展开版本号下拉，将鼠标停在要填写的版本选项中心，不用点击。采集后手动选中该版本，再关闭弹窗。", "Expand the version dropdown manually; point at the desired version option without clicking. After capture, select it manually and close the dialog.")]
-    steps += [("bottom", "关闭弹窗，将面板滚到底部，将鼠标停在「Tiếng Việt × 关卡名称」中心。找不到这一行时先停止，检查是否已添加该语言。", "Close dialogs, scroll to BOTTOM; point at Tiếng Việt × Level name. Stop if absent; check whether the language has been added."),
-              ("bottom_next", "保持面板不动，将鼠标停在「Tiếng Việt」紧接着的下一行「Deutsch × 关卡名称」中心，不是「Indonesia」。", "Do not scroll. Point at Deutsch × Level name immediately below Tiếng Việt, not Indonesia.")]
+        steps += [("version_dropdown", "关闭其他弹窗，打开版本更新记录，将鼠标停在版本号下拉按钮中心。",
+                   "Close the other editors and open Update Log. Place the pointer at the center of the version dropdown button."),
+                  ("version_option", "手动展开版本号下拉，将鼠标停在目标版本选项中心。采集后手动选中该版本，再关闭弹窗。",
+                   "Open the version dropdown and place the pointer at the center of the version you want. After capture, select that version and close the editor.")]
+    steps += [("bottom", f"关闭弹窗，把列表滚到最底部。将鼠标停在「{bottom_first}」行的「关卡名称」单元格中心。",
+               f"Close the editors and scroll the list all the way down. Place the pointer at the center of the Stage Name cell on the {bottom_first} row."),
+              ("bottom_next", f"保持列表位置。将鼠标停在紧接着的「{bottom_second}」行的「关卡名称」单元格中心。",
+               f"Keep the list in place. Place the pointer at the center of the Stage Name cell on the {bottom_second} row, immediately below {bottom_first}.")]
     return steps
 
 
-def make_calibration(captured, size, dpi, shared_dialog=True, choose_version=False):
+def make_calibration(captured, size, dpi, shared_dialog=True, choose_version=False, first_language="简体中文"):
     result = {"schema": 3, "size": size, "dpi": dpi, "scale": dpi / 96,
-              "shared_dialog": shared_dialog,
+              "shared_dialog": shared_dialog, "first_language": first_language,
               "top": {"anchor": captured["top"], "row": captured["top_next"][1] - captured["top"][1]},
               "bottom": {"anchor": captured["bottom"], "row": captured["bottom_next"][1] - captured["bottom"][1]},
               "cells": {key: captured["top" if key == "name" else key] for key, _ in FIELDS},
@@ -408,22 +456,26 @@ def restore_captured(calib, shared_dialog, choose_version):
     return captured
 
 
-def validate_captured_spacing(captured, key, size):
+def validate_captured_spacing(captured, key, size, first_language="简体中文"):
     if key not in ("top_next", "bottom_next"):
         return
     page = key.removesuffix("_next")
     row = captured[key][1] - captured[page][1]
-    validate_row_spacing(page, captured[page], row, 9 if page == "top" else 6, size)
+    validate_row_spacing(page, captured[page], row, 9 if page == "top" else 6, size, first_language)
     if key == "bottom_next":
         top_row = captured["top_next"][1] - captured["top"][1]
         if not .7 <= row / top_row <= 1.3:
+            first, second = stage_language_order(first_language)[9:11]
             raise CalibrationError(
-                f"底部行距{row * size[1]:.1f}px，顶部{top_row * size[1]:.1f}px，相差过大。请采「Tiếng Việt」紧接着的「Deutsch」，不要跨行或滚动面板。",
-                f"Bottom spacing {row * size[1]:.1f}px differs from top {top_row * size[1]:.1f}px. Capture Deutsch immediately below Tiếng Việt without scrolling.", key)
+                f"底部行距{row * size[1]:.1f}px，顶部{top_row * size[1]:.1f}px，相差过大。保持列表位置，采集「{first}」紧接着的「{second}」。",
+                f"Bottom spacing {row * size[1]:.1f}px differs from top {top_row * size[1]:.1f}px. Keep the list in place and capture {second} immediately below {first}.", key)
 
 
 def do_fill(plan, calib, hwnd, log, speed=1.0, should_stop=lambda: False, tr=lambda cn, en: cn, probe=False, clipboard_owner=None, choose_version=False, confirm_page=None):
-    validate_calibration(calib)
+    order = validate_calibration(calib)
+    if any(not 0 <= index < len(order) or order[index] != lang for index, lang, _, _, _ in plan):
+        raise CalibrationError("待填写语言的行序与校准不一致，请检查首行语言。",
+                               "The fill plan and calibration disagree on the language order. Check the stage's first row.")
     if choose_version and "version_selector" not in calib:
         raise ValueError(tr("尚未校准版本号下拉与选项，请重新校准。", "Version dropdown and option have not been calibrated. Recalibrate first."))
     page_now = None
@@ -439,7 +491,9 @@ def do_fill(plan, calib, hwnd, log, speed=1.0, should_stop=lambda: False, tr=lam
             # Losing foreground focus must never send clicks/text into another app.
             if user32.GetForegroundWindow() != hwnd:
                 raise Stopped(tr("游戏失去焦点", "Game lost focus"))
-            prefix = f"[{number}/{len(plan)}] {tr(LANG_NAMES_CN[index], LANG_NAMES_EN[index])} · {tr(cn, dict(zip([f[0] for f in FIELDS], ['Level name', 'Gameplay instructions', 'Level description', 'Version history']))[key])}"
+            language_index = LANGS.index(lang)
+            language_name = tr(LANG_NAMES_CN[language_index], LANG_NAMES_EN[language_index])
+            prefix = f"[{number}/{len(plan)}] {language_name} · {tr(cn, FIELD_NAMES_EN[key])}"
             modal_open = False
             try:
                 page = "top" if index < 9 else "bottom"
@@ -518,6 +572,44 @@ def do_fill(plan, calib, hwnd, log, speed=1.0, should_stop=lambda: False, tr=lam
 LANGS = ["简体中文", "繁體中文", "English", "한국어", "日本語", "Español", "Français", "Русский", "ภาษาไทย", "Tiếng Việt", "Deutsch", "Indonesia", "Italiano", "Português", "Türkçe"]
 LANG_NAMES_CN = ["简体中文", "繁体中文", "英语", "韩语", "日语", "西班牙语", "法语", "俄语", "泰语", "越南语", "德语", "印度尼西亚语", "意大利语", "葡萄牙语", "土耳其语"]
 LANG_NAMES_EN = ["Simplified Chinese", "Traditional Chinese", "English", "Korean", "Japanese", "Spanish", "French", "Russian", "Thai", "Vietnamese", "German", "Indonesian", "Italian", "Portuguese", "Turkish"]
+
+
+def stage_language_order(first_language):
+    if first_language not in LANGS:
+        raise CalibrationError("请选择游戏首行标为「默认」的语言。",
+                               "Choose the language marked Default in the first row of the game.")
+    return (first_language, *(lang for lang in LANGS if lang != first_language))
+
+
+def text_calibration_paths(draft=False):
+    path = Path(CALIB_DRAFT_FILE if draft else CALIB_FILE)
+    return path, path.with_stem(path.stem + "-en")
+
+
+def load_calibration(preset_name, *saved_paths):
+    for path in saved_paths:
+        try:
+            return json.loads(Path(path).read_text(encoding="utf-8")), False
+        except FileNotFoundError:
+            continue
+    return json.loads((PRESET_DIR / preset_name).read_text(encoding="utf-8")), True
+
+
+def load_text_calibration(first_language):
+    stage_language_order(first_language)
+    saved, from_preset = load_calibration("text.json", *text_calibration_paths())
+    # Geometry is shared. Bind the current stage's row order for this run only.
+    return {**saved, "first_language": first_language}, from_preset
+
+
+def check_preset_size(calib, size, tr):
+    width, height = size
+    reference_width, reference_height = calib["size"]
+    if abs(width * reference_height - height * reference_width) > height * reference_width * .01:
+        raise ValueError(tr("内置坐标适用于 16:9 游戏布局。请为当前窗口记录校准。",
+                            "The built-in positions are for the 16:9 game layout. Calibrate for this window."))
+
+
 LANG_HINTS = {lang: [lang, cn, en] for lang, cn, en in zip(LANGS, LANG_NAMES_CN, LANG_NAMES_EN)}
 LANG_HINTS["简体中文"] += ["简体", "簡體", "简中"]
 LANG_HINTS["繁體中文"] += ["繁体", "繁體", "繁中"]
@@ -525,6 +617,13 @@ LANG_HINTS["English"] += ["英文"]
 LANG_HINTS["한국어"] += ["韩文", "韓語"]
 LANG_HINTS["日本語"] += ["日文", "日語"]
 FIELDS = [("name", "关卡名称"), ("notes", "玩法说明"), ("desc", "关卡描述"), ("version", "版本更新记录")]
+FIELD_NAMES_EN = {"name": "Stage Name", "notes": "Gameplay Details",
+                  "desc": "Stage Description", "version": "Update Log"}
+FIELD_ALIASES = {key: (cn, FIELD_NAMES_EN[key].casefold()) for key, cn in FIELDS}
+FIELD_ALIASES["name"] += ("level name",)
+FIELD_ALIASES["notes"] += ("gameplay instructions",)
+FIELD_ALIASES["desc"] += ("level description",)
+FIELD_ALIASES["version"] += ("version history",)
 
 
 # ---------------------------------------------------------------- 读表（不写死行号、列号）
@@ -663,9 +762,9 @@ def read_table(path, sheet=None, log=print):
         for r in range(1, ws.max_row + 1):
             v = ws.cell(r, 1)
             if isinstance(v, str):
-                v = v.strip()
-                for k, cn in FIELDS:
-                    if (v == cn or v.startswith(cn)) and k not in label_row:
+                v = v.strip().casefold()
+                for k, aliases in FIELD_ALIASES.items():
+                    if k not in label_row and v.startswith(aliases):
                         label_row[k] = r
 
         # 3) 取每格文本（合并单元格取左上角那格；往下找 6 行兜底）
@@ -698,23 +797,28 @@ def read_table(path, sheet=None, log=print):
 
 def write_template(path, english=False):
     from xml.sax.saxutils import escape
-    rows = {1: ["Field / Language" if english else "字段 / 语言"] + (LANG_NAMES_EN if english else LANG_NAMES_CN),
-            2: ["关卡名称"] + ["示例关卡" if i == 0 else "" for i in range(15)],
-            3: ["说明：在对应语言列填写关卡名称。"],
-            9: ["玩法说明"] + ["示例：完成挑战。" if i == 0 else "" for i in range(15)],
-            10: ["说明：填写玩法和操作说明。"],
-            12: ["关卡描述"] + ["示例：探索这座岛屿。" if i == 0 else "" for i in range(15)],
-            13: ["说明：填写关卡介绍。"],
-            16: ["版本更新记录"] + ["示例：首次发布。" if i == 0 else "" for i in range(15)],
-            17: ["说明：填写本次更新描述，可留空；游戏内版本号下拉保持当前选项。"]}
-    if english:
-        translations = {"示例关卡": "Example level", "示例：完成挑战。": "Example: Complete the challenge.",
-                        "示例：探索这座岛屿。": "Example: Explore the island.", "示例：首次发布。": "Example: Initial release.",
-                        "说明：在对应语言列填写关卡名称。": "Instructions: Replace the example in row 2; each language has its own column.",
-                        "说明：填写玩法和操作说明。": "Instructions: Enter gameplay instructions in row 9.",
-                        "说明：填写关卡介绍。": "Instructions: Enter the level description in row 12.",
-                        "说明：填写本次更新描述，可留空；游戏内版本号下拉保持当前选项。": "Instructions: Enter version description in row 16; optional. The in-game version dropdown is kept unchanged."}
-        rows = {r: [translations.get(v, v) for v in values] for r, values in rows.items()}
+
+    def field_row(key, cn, en):
+        label = (FIELD_NAMES_EN if english else dict(FIELDS))[key]
+        example_language = "English" if english else "简体中文"
+        example = en if english else cn
+        return [label] + [example if lang == example_language else "" for lang in LANGS]
+
+    rows = {
+        1: ["Field / Language" if english else "字段 / 语言"] + (LANG_NAMES_EN if english else LANG_NAMES_CN),
+        2: field_row("name", "示例关卡", "Skybound Dash"),
+        3: ["Instructions: Replace the example with your stage name in each language column. Keep the headers."
+            if english else "说明：替换示例，在对应语言列填写关卡名称并保留表头。"],
+        9: field_row("notes", "示例：完成挑战。", "Reach the finish line before time runs out."),
+        10: ["Instructions: Explain the goal and controls in row 9."
+             if english else "说明：填写玩法和操作说明。"],
+        12: field_row("desc", "示例：探索这座岛屿。", "A short race across floating islands."),
+        13: ["Instructions: Enter a short description of your stage in row 12."
+             if english else "说明：填写关卡介绍。"],
+        16: field_row("version", "示例：新增终点前的检查点。", "Added a checkpoint before the final jump."),
+        17: ["Instructions: Describe the changes in row 16 for an update. Clear the example for a first release."
+             if english else "说明：更新时填写本次改动，首次发布请清空示例。"],
+    }
     def col(n):
         result = ""
         while n:
@@ -730,7 +834,7 @@ def write_template(path, english=False):
     parts = {
       '[Content_Types].xml': '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>',
       '_rels/.rels': '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
-      'xl/workbook.xml': '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="多语言" sheetId="1" r:id="rId1"/></sheets></workbook>',
+      'xl/workbook.xml': '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="' + ('Stage Info' if english else '多语言') + '" sheetId="1" r:id="rId1"/></sheets></workbook>',
       'xl/_rels/workbook.xml.rels': '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>',
       'xl/worksheets/sheet1.xml': sheet,
     }
@@ -1036,10 +1140,11 @@ def do_media(plan, calib, hwnd, log, should_stop=lambda: False, tr=lambda cn, en
 # ---------------------------------------------------------------- GUI
 class CalibrationWizard:
     """One reusable window; Back cancels a pending capture and keeps earlier points."""
-    def __init__(self, app, hwnd, shared_dialog=True, choose_version=False, resume=True):
+    def __init__(self, app, hwnd, shared_dialog=True, choose_version=False, resume=True, first_language="简体中文"):
         self.app, self.hwnd = app, hwnd
         self.shared = shared_dialog
         self.choose_version = choose_version
+        self.first_language = first_language
         _, self.size, self.dpi = geometry(hwnd)
         self.steps = self.get_steps()
         self.captured = {}
@@ -1068,37 +1173,45 @@ class CalibrationWizard:
         self.poll_stop()
 
     def get_steps(self):
-        return calibration_steps(self.shared, self.choose_version)
+        return calibration_steps(self.shared, self.choose_version, self.first_language)
+
+    def matches_layout(self, data):
+        return data.get("size") == list(self.size) and data.get("dpi") == self.dpi
 
     def restore(self):
+        for path in text_calibration_paths(draft=True):
+            try:
+                draft = json.loads(path.read_text(encoding="utf-8"))
+                if (draft.get("schema") == 3 and self.matches_layout(draft)
+                        and draft.get("shared") == self.shared and draft.get("choose_version") == self.choose_version):
+                    self.captured = draft["captured"]
+                    self.index = draft.get("index", 0)
+                    self.app.log(self.app.tr("已恢复校准草稿，可返回检查或重采。",
+                                             "Calibration draft restored. Use Back to review or recapture a point."))
+                    return
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                continue
         try:
-            with open(CALIB_DRAFT_FILE, encoding="utf-8") as stream:
-                draft = json.load(stream)
-            if draft.get("schema") == 3 and draft.get("size") == list(self.size) and draft.get("dpi") == self.dpi and draft.get("shared") == self.shared and draft.get("choose_version") == self.choose_version:
-                self.captured = draft["captured"]
-                self.index = draft.get("index", 0)
-                self.app.log(self.app.tr("已恢复未完成的校准，可返回修改。", "Unfinished calibration restored; Back revisits captured points."))
-                return
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
-        try:
-            with open(CALIB_FILE, encoding="utf-8") as stream:
-                saved = json.load(stream)
-            if saved.get("size") != list(self.size) or saved.get("dpi") != self.dpi:
+            saved, from_preset = load_text_calibration(self.first_language)
+            if not self.matches_layout(saved):
                 return
             self.captured = restore_captured(saved, self.shared, self.choose_version)
             self.index = next((i for i, (key, _, _) in enumerate(self.steps) if key not in self.captured), len(self.steps))
-            self.app.log(self.app.tr(f"已复用{len(self.captured)}个校准点，从尚缺的点继续；旧版底部两点必须重采。", f"Reused {len(self.captured)} points; continuing from missing points. Legacy bottom anchors must be recaptured."))
+            self.app.log(self.app.tr("已载入内置文字坐标。", "Loaded the built-in text positions.") if from_preset
+                         else self.app.tr("已载入保存的文字坐标。", "Loaded saved text positions."))
+            self.app.log(self.app.tr("可继续采集缺少的点，也可返回重采。", "Capture the remaining points or use Back to recapture."))
         except (OSError, ValueError, KeyError, TypeError):
             self.captured, self.index = {}, 0
 
     def persist(self):
         draft = {"schema": 3, "size": self.size, "dpi": self.dpi, "shared": self.shared,
-                 "choose_version": self.choose_version, "captured": self.captured, "index": self.index}
-        temporary = CALIB_DRAFT_FILE + ".tmp"
-        with open(temporary, "w", encoding="utf-8") as stream:
+                 "choose_version": self.choose_version, "first_language": self.first_language,
+                 "captured": self.captured, "index": self.index}
+        path = Path(CALIB_DRAFT_FILE)
+        temporary = path.with_suffix(".json.tmp")
+        with temporary.open("w", encoding="utf-8") as stream:
             json.dump(draft, stream, ensure_ascii=False, indent=2)
-        os.replace(temporary, CALIB_DRAFT_FILE)
+        os.replace(temporary, path)
 
     def cancel_pending(self):
         self.generation += 1
@@ -1112,7 +1225,7 @@ class CalibrationWizard:
         tr = self.app.tr
         self.back.configure(state="normal" if self.index else "disabled")
         if self.index == len(self.steps):
-            self.instruction.configure(text=tr("采集完成。可以返回检查任意一步，确认后保存。", "All points captured. Go back to review any step, or save."))
+            self.instruction.configure(text=tr("坐标已就绪。可以返回检查或重采，确认后保存。", "The points are ready. Go back to review or recapture them, then save."))
             self.status.configure(text=tr("尚未保存；原校准文件保持不变。", "Not saved yet; your previous calibration is unchanged."))
             self.capture_button.configure(text=tr("保存校准", "Save calibration"), state="normal", command=self.save)
             self.next.configure(state="disabled")
@@ -1121,7 +1234,8 @@ class CalibrationWizard:
             self.instruction.configure(text=f"{self.index + 1}/{len(self.steps)}  " + tr(cn, en))
             self.capture_button.configure(text=tr("重新采集（5秒）" if key in self.captured else "采集当前点（5秒）", "Recapture (5 s)" if key in self.captured else "Capture point (5 s)"), state="normal", command=self.capture)
             self.next.configure(state="normal" if key in self.captured else "disabled")
-            self.status.configure(text=tr("这个点已记录，可重新采集或直接下一步。" if key in self.captured else "点采集后有5秒移动鼠标，不用点击游戏。F9取消。", "Point recorded; recapture it or continue." if key in self.captured else "After Capture, position the pointer within 5 seconds. No game click needed. F9 cancels."))
+            self.status.configure(text=tr("这个点已记录，可重新采集或直接下一步。" if key in self.captured else "点「采集当前点」后，在 5 秒内将鼠标移到目标上并停住。采集时只移动鼠标。F9 取消。",
+                                          "Point recorded. Capture it again or click Next." if key in self.captured else "Click Capture, then move the pointer to the target within five seconds and hold it there. Hover during capture. Press F9 to cancel."))
 
     def capture(self):
         self.cancel_pending()
@@ -1151,7 +1265,7 @@ class CalibrationWizard:
                 raise ValueError(self.app.tr("鼠标不在游戏客户区内。可重新采集。", "Pointer outside game client area. Try capturing again."))
             key, cn, en = self.steps[index]
             proposed = dict(self.captured, **{key: point})
-            validate_captured_spacing(proposed, key, self.size)
+            validate_captured_spacing(proposed, key, self.size, self.first_language)
             self.captured[key] = point
             self.app.log(self.app.tr(f"已采集第{index + 1}步：", f"Captured step {index + 1}: ") + str(tuple(round(n, 5) for n in point)))
             self.go(index + 1)
@@ -1164,13 +1278,13 @@ class CalibrationWizard:
 
     def save(self):
         try:
-            calib = make_calibration(self.captured, self.size, self.dpi, self.shared, self.choose_version)
+            calib = make_calibration(self.captured, self.size, self.dpi, self.shared, self.choose_version, self.first_language)
             # Write only after all points validate; a failed save keeps the previous file intact.
-            temporary = CALIB_FILE + ".tmp"
-            with open(temporary, "w", encoding="utf-8") as stream:
+            path = Path(CALIB_FILE)
+            temporary = path.with_suffix(".json.tmp")
+            with temporary.open("w", encoding="utf-8") as stream:
                 json.dump(calib, stream, ensure_ascii=False, indent=2)
-            os.replace(temporary, CALIB_FILE)
-            self.app.calib = calib
+            os.replace(temporary, path)
             self.app.log(self.app.tr(f"校准已保存。顶部行距 {calib['top']['row'] * self.size[1]:.1f}px；底部行距 {calib['bottom']['row'] * self.size[1]:.1f}px。", f"Calibration saved. Top row spacing {calib['top']['row'] * self.size[1]:.1f}px; bottom spacing {calib['bottom']['row'] * self.size[1]:.1f}px."))
             self.app.log_geometry(self.hwnd)
             self.close()
@@ -1216,12 +1330,14 @@ class MediaCalibrationWizard(CalibrationWizard):
 
     def restore(self):
         try:
-            with open(MEDIA_CALIB_FILE, encoding="utf-8") as stream:
-                saved = json.load(stream)
+            saved, from_preset = load_calibration("media.json", MEDIA_CALIB_FILE)
             if saved.get("schema") == 1 and saved.get("size") == list(self.size) and saved.get("dpi") == self.dpi:
                 self.captured = saved["points"]
                 self.index = next((i for i, (key, _, _) in enumerate(self.steps) if key not in self.captured), len(self.steps))
-        except (OSError, ValueError, KeyError, TypeError):
+                if from_preset:
+                    self.app.log(self.app.tr("已载入内置媒体坐标，可返回重采。",
+                                             "Loaded the built-in media positions. Use Back to recapture."))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             self.captured = {}
 
     def persist(self):
@@ -1355,17 +1471,16 @@ class MediaPanel:
             plan = self.plan()
             hwnd = app.game()
             try:
-                with open(MEDIA_CALIB_FILE, encoding="utf-8") as stream:
-                    calib = json.load(stream)
+                calib, from_preset = load_calibration("media.json", MEDIA_CALIB_FILE)
                 validate_media_calibration(calib, plan)
-            except (OSError, ValueError, KeyError, TypeError) as exc:
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 raise ValueError(app.tr("请先点「校准媒体位置」，补齐本次所需的坐标。", "Use Calibrate media to record all positions needed for this run.")) from exc
             delay = self.delay.get()
             if not 1 <= delay <= 120:
                 raise ValueError(app.tr("导入等待须在1～120秒之间。", "Import wait must be 1–120 seconds."))
             if not messagebox.askokcancel(app.tr("核对媒体页面", "Verify media page"),
-                    app.tr("请关闭多语言面板和文件弹窗，将右侧列表滚到底部，与媒体校准时一致。\n\n所选展示图会从第1格按顺序填入；请先手动清空已有展示图。不会自动删除图片或点击提交。\n确认准备好后继续，F9随时停止。",
-                           "Close multilingual settings and file dialogs. Scroll the right panel to bottom, as during media calibration.\n\nSelected images fill slots starting at 1; clear existing images manually first. No automatic removal or final Submit.\nContinue when ready. F9 stops at any time."), parent=self.window):
+                    app.tr("关闭多语言面板和文件弹窗，将右侧列表滚到底部。\n\n展示图从第 1 格按顺序填入，请先手动清空已有展示图。填写前可用「核对媒体位置」检查落点。F9 停止。",
+                           "Close Multilanguage Settings and any file dialogs, then scroll the right panel all the way down.\n\nImages fill from slot 1. Clear existing images first and use Check positions before filling. Press F9 to stop."), parent=self.window):
                 return
         except Exception as exc:
             app.error(exc)
@@ -1384,7 +1499,10 @@ class MediaPanel:
             try:
                 pause(.6, should_stop)
                 activate_media_game(hwnd, should_stop, tr)
-                app.log_geometry(hwnd, log=app.messages.put, tr=tr)
+                size = app.log_geometry(hwnd, log=app.messages.put, tr=tr)
+                if from_preset:
+                    check_preset_size(calib, size, tr)
+                    app.messages.put(tr("使用内置媒体坐标。", "Using the built-in media positions."))
                 do_media(plan, calib, hwnd, app.messages.put, should_stop, tr, owner, delay, probe)
             except Stopped as exc:
                 app.messages.put(tr("媒体操作已停止。", "Media operation stopped.") + str(exc))
@@ -1402,12 +1520,12 @@ class App:
         root.geometry("950x650")
         self.ui_language = tk.StringVar(value="中文")
         self.path, self.sheet = tk.StringVar(), tk.StringVar()
+        self.first_language = tk.StringVar(value=LANGS[0])
         self.speed = tk.DoubleVar(value=1.0)
         self.shared_dialog = tk.BooleanVar(value=True)
         self.lang_vars = {lang: tk.BooleanVar(value=True) for lang in LANGS}
         self.field_vars = {key: tk.BooleanVar(value=key != "version") for key, _ in FIELDS}
         self.busy = False
-        self.calib = None
         self.stop_event = threading.Event()
         self.messages = queue.Queue()
         self.widgets = []
@@ -1427,18 +1545,25 @@ class App:
     def _build(self):
         pad = dict(padx=6, pady=3)
         f1 = ttk.Frame(self.root); f1.pack(fill="x", **pad)
-        self.widget(ttk.Button, f1, "① 选择 Excel 表格…", "① Choose Excel…", command=self.pick_file).pack(side="left")
-        self.widget(ttk.Button, f1, "导出表格模板", "Export template", command=self.export_template).pack(side="left", padx=4)
+        self.widget(ttk.Button, f1, "导出 Excel 模板…", "Export Excel Template…", command=self.export_template).pack(side="left")
+        self.widget(ttk.Button, f1, "① 打开填好的 Excel…", "① Open Filled Excel…", command=self.pick_file).pack(side="left", padx=4)
         self.widget(ttk.Button, f1, "封面 / 展示图 / 视频…", "Cover / Images / Video…", command=self.open_media).pack(side="left", padx=4)
         switch = ttk.Combobox(f1, textvariable=self.ui_language, values=("中文", "English"), width=8, state="readonly")
         switch.pack(side="right")
+        ttk.Label(f1, text="Language").pack(side="right", padx=(0, 6))
         switch.bind("<<ComboboxSelected>>", lambda _: self.translate_ui())
+        self.widget(ttk.Label, self.root, "先导出模板，填入关卡资料并保存，再用①打开。",
+                    "Export the Excel template, enter your stage info, save it, then open the workbook with ①.",
+                    wraplength=900).pack(anchor="w", padx=12, pady=(3, 0))
         ttk.Label(self.root, textvariable=self.path, foreground="#555").pack(anchor="w", padx=12)
         f2 = ttk.Frame(self.root); f2.pack(fill="x", **pad)
         self.widget(ttk.Label, f2, "工作表", "Worksheet").pack(side="left")
         self.sheet_box = ttk.Combobox(f2, textvariable=self.sheet, width=24, state="readonly")
         self.sheet_box.pack(side="left", padx=6)
         self.sheet_box.bind("<<ComboboxSelected>>", lambda _: self.preview())
+        self.widget(ttk.Label, f2, "游戏首行（默认语言）", "Stage Default Language (Row 1)").pack(side="left", padx=(12, 0))
+        ttk.Combobox(f2, textvariable=self.first_language, values=LANGS, width=12,
+                     state="readonly").pack(side="left", padx=6)
         f3 = self.widget(ttk.LabelFrame, self.root, "语言", "Languages"); f3.pack(fill="x", **pad)
         self.lang_checks = []
         for i, lang in enumerate(LANGS):
@@ -1446,10 +1571,10 @@ class App:
             check.grid(row=i // 5, column=i % 5, sticky="w", padx=4)
             self.lang_checks.append(check)
         f4 = self.widget(ttk.LabelFrame, self.root, "要填的项", "Fields"); f4.pack(fill="x", **pad)
-        for (key, cn), en in zip(FIELDS, ("Level name", "Gameplay instructions", "Level description", "Version history")):
-            self.widget(ttk.Checkbutton, f4, cn, en, variable=self.field_vars[key]).pack(side="left", padx=4)
+        for key, cn in FIELDS:
+            self.widget(ttk.Checkbutton, f4, cn, FIELD_NAMES_EN[key], variable=self.field_vars[key]).pack(side="left", padx=4)
         f5 = ttk.Frame(self.root); f5.pack(fill="x", **pad)
-        for cn, en, callback in (("② 打开游戏→多语言设置（说明）", "② Open game settings (help)", self.help),
+        for cn, en, callback in (("② 使用说明", "② Setup Guide", self.help),
                                   ("③ 校准一次", "③ Calibrate", self.calibrate),
                                   ("④ 看格子位置", "④ Check positions", self.probe),
                                   ("⑤ 一键填写", "⑤ Fill all", self.fill)):
@@ -1464,7 +1589,8 @@ class App:
         self.log(self.tr(f"当前版本：v{APP_VERSION}", f"Version: v{APP_VERSION}"))
         self.log(self.tr("运行文件：", "Running file: ") + str(application_file()))
         self.log(self.tr("进程号：", "Process ID: ") + str(os.getpid()))
-        self.log(self.tr("先点 ① 选表；然后按 ②③④⑤ 的顺序来。最终提交由你确认。", "Choose Excel with ①, then follow ②③④⑤. Review the result and submit it yourself."))
+        self.log(self.tr("导出 Excel 模板，填好并保存，再用①打开。②可查看完整步骤。",
+                         "Export the Excel template, fill it in, and save it. Open it with ①. Click ② for the full setup guide."))
 
     def translate_ui(self):
         for widget, cn, en in self.widgets:
@@ -1495,13 +1621,24 @@ class App:
                 if message is None:
                     self.busy = False
                 elif isinstance(message, tuple) and message[0] == "confirm_page":
-                    _, page, reply, event = message
+                    _, page, order, reply, event = message
                     try:
                         if self.stop_event.is_set():
                             reply["ok"] = False
                         else:
-                            label = self.tr("顶部，第一行是「简体中文」", "TOP, with 简体中文 as the first row") if page == "top" else self.tr("底部，能看到「Tiếng Việt / Deutsch / Indonesia / Italiano / Português / Türkçe」", "BOTTOM, showing Tiếng Việt / Deutsch / Indonesia / Italiano / Português / Türkçe")
-                            reply["ok"] = messagebox.askokcancel(self.tr("核对页面", "Verify page"), self.tr(f"请确认游戏面板已到{label}。\n\n如果没有滚动，可先手动滚到该位置再点确定；取消会停止。确认前不会定位或填写该屏格子。", f"Confirm the game panel is at {label}.\n\nIf scrolling failed, scroll there manually before OK. Cancel stops. No row positioning or text entry happens until confirmation."), parent=self.root)
+                            if page == "top":
+                                heading = self.tr("将列表滚到最顶部，核对前 9 行的语言顺序。",
+                                                  "Scroll all the way up and check the order of the first nine rows.")
+                                rows = order[:9]
+                            else:
+                                heading = self.tr("将列表滚到最底部，核对最后 6 行的语言顺序。",
+                                                  "Scroll all the way down and check the order of the last six rows.")
+                                rows = order[9:]
+                            instruction = self.tr("顺序相同才点确定。如果顺序不同，请取消并检查游戏首行和已添加的语言。",
+                                                  "Click OK only if the order matches. If it differs, cancel and check the stage's first row and added languages.")
+                            reply["ok"] = messagebox.askokcancel(
+                                self.tr("核对语言顺序", "Check Language Order"),
+                                f"{heading}\n\n{' → '.join(rows)}\n\n{instruction}", parent=self.root)
                     finally:
                         event.set()
                 else:
@@ -1535,30 +1672,40 @@ class App:
             detected = {lang for values in texts.values() for lang in values}
             for lang, check in zip(LANGS, self.lang_checks):
                 check.configure(state="normal" if lang in detected else "disabled")
-            for (key, cn), en in zip(FIELDS, ("Level name", "Gameplay instructions", "Level description", "Version history")):
+            for key, cn in FIELDS:
                 got = [self.tr(LANG_NAMES_CN[i], LANG_NAMES_EN[i]) for i, lang in enumerate(LANGS) if lang in texts.get(key, {})]
-                self.log(self.tr(cn, en) + self.tr(f"：{len(got)} 种语言（", f": {len(got)} languages (") + ", ".join(got) + ")")
+                self.log(self.tr(cn, FIELD_NAMES_EN[key]) + self.tr(f"：{len(got)} 种语言（", f": {len(got)} languages (") + ", ".join(got) + ")")
         except Exception as exc:
             self.error(exc)
 
     def export_template(self):
-        path = filedialog.asksaveasfilename(title=self.tr("导出表格模板", "Export template"), defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
+        path = filedialog.asksaveasfilename(title=self.tr("导出 Excel 模板", "Export Excel Template"),
+                                          initialfile=self.tr("多语言填写模板.xlsx", "Miliastra Preview Template.xlsx"),
+                                          defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
         if path:
             try:
                 write_template(path, english=self.ui_language.get() == "English")
-                self.log(self.tr("模板已导出：", "Template exported: ") + path)
+                self.log(self.tr(f"模板已保存到 {path}。填好后请用①打开。",
+                                 f"Template saved to {path}. Enter your stage info, save the workbook, then open it with ①."))
             except Exception as exc:
                 self.error(exc)
 
     def help(self):
         messagebox.showinfo(self.root.title(), self.tr(
-            "1. 打开原神，进入关卡详情面板\n2. 点「关卡详情页-多语言设置」旁边的 ✎\n3. 按③采集两屏锚点、行距和弹窗位置，再按④核对。向导可以返回上一步。\n\n默认共用弹窗位置，共9点。滚轮在列表中间行发送，每次换屏需要确认实际页面。首次发布不要勾选版本更新记录；测试更新时先勾选该字段，再按③补录版本下拉和目标选项，所有语言共用。F9随时停止。弹窗确认会保存，外面的「提交」由你自己点。",
-            "1. Open Genshin Impact and the level details.\n2. Open the multilingual settings with the pencil button.\n3. Use ③ to capture page anchors, spacing and dialogs; verify with ④. Back revisits earlier steps.\n\nShared dialogs need 9 points. Wheel input targets a middle list row; confirm the actual page after each switch. Leave Version history unchecked for first publication. For updates, check Version history and use ③ to capture its version dropdown and target option once for all languages. F9 stops at any time. Dialog Confirm saves the text; click the outer Submit yourself."))
+            "1. 点「导出 Excel 模板」。在各语言列的第 2、9、12、16 行填写关卡资料，保留表头，首次发布请清空第 16 行示例。保存后用①打开并选工作表。\n\n"
+            "2. 在游戏里打开关卡详情页的多语言设置。如果语言未齐，通过「添加语言 → 全选」启用 15 种语言。滚到顶部，在工具里选择游戏首行标着「默认」的语言。\n\n"
+            "3. 点④，使用已保存或内置的坐标核对两屏语言顺序和鼠标落点。落点偏移时点③。每次点「采集当前点」后，在 5 秒内把鼠标移到指定单元格、图标或保存按钮的中心并停住。\n\n"
+            "4. 核对后点⑤填写，检查内容后在游戏里手动提交。F9 停止。首次发布保持「版本更新记录」未勾选。更新时检查预设是否对应目标版本，必要时用③重采版本选项。",
+            "1. Click Export Excel Template. Enter your stage info in the language columns on rows 2, 9, 12 and 16. Keep the headers and clear the row 16 example for a first release. Save the workbook, open it with ① and select a worksheet.\n\n"
+            "2. Open Stage Details > Multilanguage Settings in Genshin Impact. If any languages are missing, use Add Language > Select All > OK to enable all 15. Scroll to the top and set Stage Default Language (Row 1) in the tool to the language marked Default in the game.\n\n"
+            "3. Use ④ Check positions to verify the row order and pointer targets with saved or built-in positions. If a target is off, open ③ Calibrate. Click Capture and move the pointer to the center of the indicated cell, icon, or OK button within five seconds. Hold it there until the timer ends.\n\n"
+            "4. Click ⑤ Fill all after checking the targets. Review the result in the game before you submit. Press F9 to stop. Leave Update Log unchecked for a first release. For an update, check the preset version position and use ③ to capture a different option if needed."))
 
     def game(self):
         hwnd = find_game_window()
         if not hwnd:
-            raise ValueError(self.tr("找不到标题含「原神」的窗口，先把游戏开着。", "No window titled 原神 found. Open the game first."))
+            raise ValueError(self.tr("找不到原神游戏窗口。请先启动 PC 客户端并打开游戏窗口。",
+                                     "Couldn't find the Genshin Impact game window. Launch the PC game and keep its window open."))
         return hwnd
 
     def log_geometry(self, hwnd, log=None, tr=None):
@@ -1568,16 +1715,20 @@ class App:
         rect = wintypes.RECT()
         if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             log(tr(f"物理窗口外框 {rect.right - rect.left}×{rect.bottom - rect.top}，左上 ({rect.left}, {rect.top})。比例坐标以客户区为准。", f"Physical outer window {rect.right - rect.left}×{rect.bottom - rect.top}, origin ({rect.left}, {rect.top}). Proportional coordinates use the client area."))
+        return size
 
     def calibrate(self):
         if self.busy:
             return
         try:
+            first_language = self.first_language.get()
+            stage_language_order(first_language)
             hwnd = self.game()
             self.log_geometry(hwnd)
             self.stop_event.clear()
             self.busy = True
-            CalibrationWizard(self, hwnd, shared_dialog=self.shared_dialog.get(), choose_version=self.field_vars["version"].get())
+            CalibrationWizard(self, hwnd, shared_dialog=self.shared_dialog.get(), choose_version=self.field_vars["version"].get(),
+                              first_language=first_language)
         except Exception as exc:
             self.busy = False
             self.error(exc)
@@ -1586,24 +1737,31 @@ class App:
         if self.busy:
             return
         try:
-            if self.calib is None:
-                try:
-                    with open(CALIB_FILE, encoding="utf-8") as stream:
-                        self.calib = json.load(stream)
-                except FileNotFoundError as exc:
-                    raise ValueError(self.tr("还没有校准数据。请先点③完成校准，再使用④或⑤。也可以把旧版的「多语言填选-calib.json」复制到当前 exe 旁边。", "No calibration yet. Complete ③ before using ④ or ⑤, or copy your previous 多语言填选-calib.json next to this exe.")) from exc
-                except (ValueError, UnicodeError) as exc:
-                    raise ValueError(self.tr("校准文件无法读取，请点③重新校准。", "The calibration file is invalid. Use ③ to calibrate again.")) from exc
-            validate_calibration(self.calib)
+            first_language = self.first_language.get()
+            try:
+                calib, from_preset = load_text_calibration(first_language)
+            except CalibrationError:
+                raise
+            except (OSError, ValueError, TypeError) as exc:
+                raise ValueError(self.tr("校准文件无法读取，请点③重新校准。", "The calibration file is invalid. Use ③ to calibrate again.")) from exc
+            order = validate_calibration(calib)
+            if not self.path.get():
+                raise ValueError(self.tr("请先导出模板、填写保存，再用①打开表格。",
+                                         "Export the Excel template, fill it in, save it, then open it with ①."))
             hwnd = self.game()
-            self.log_geometry(hwnd)
+            size = self.log_geometry(hwnd)
+            if from_preset:
+                check_preset_size(calib, size, self.tr)
+                self.log(self.tr("使用内置文字坐标，填写前先用④核对落点。",
+                                 "Using the built-in text positions. Verify targets with ④ before filling."))
             texts = read_table(self.path.get(), self.sheet.get(), log=lambda _: None)
-            plan = build_plan(texts, [l for l in LANGS if self.lang_vars[l].get()], [k for k, _ in FIELDS if self.field_vars[k].get()])
+            plan = build_plan(texts, [l for l in LANGS if self.lang_vars[l].get()],
+                              [k for k, _ in FIELDS if self.field_vars[k].get()], first_language)
             if not plan:
                 raise ValueError(self.tr("按现在的勾选没有可填的内容。", "No content matches the current selection."))
             choose_version = any(cell[2] == "version" for cell in plan)
-            if choose_version and "version_selector" not in self.calib:
-                raise ValueError(self.tr("请先校准版本号下拉与目标选项。", "Calibrate the version dropdown and target option first."))
+            if choose_version and "version_selector" not in calib:
+                raise ValueError(self.tr("请先校准版本号下拉与目标选项。", "Calibrate the Update Log version dropdown and target option first."))
             if not user32.SetForegroundWindow(hwnd):
                 raise OSError(self.tr("无法激活游戏窗口。", "Cannot activate the game window."))
         except Exception as exc:
@@ -1619,14 +1777,14 @@ class App:
         self.log(tr("仅在列表内发送滚轮、移动鼠标，不点击或填写格子；每次换屏后先确认。F9停止。" if probe else f"开始填 {len(plan)} 格。F9随时停止。", "Scrolling over the list and moving the pointer only; no cell clicks or edits. Confirm each page. F9 stops." if probe else f"Filling {len(plan)} cells. Press F9 to stop at any time."))
         if not probe:
             versions = sum(cell[2] == "version" for cell in plan)
-            self.log(tr(f"本次版本更新记录：{versions}格。" + ("会选择已校准的版本号。" if versions else "未勾选该字段或无内容，本次不会操作版本号。"), f"Version history: {versions} cells. " + ("The calibrated version will be selected." if versions else "Field unchecked or empty; no version operation this run.")))
+            self.log(tr(f"本次版本更新记录：{versions}格。" + ("会选择已校准的版本号。" if versions else "未勾选该字段或无内容，本次不会操作版本号。"), f"Update Log: {versions} cells. " + ("The calibrated version will be selected." if versions else "No Update Log entries selected.")))
         def should_stop():
             if user32.GetAsyncKeyState(0x78) & 0x8000:
                 self.stop_event.set()
             return self.stop_event.is_set()
         def confirm_page(page):
             event, reply = threading.Event(), {}
-            self.messages.put(("confirm_page", page, reply, event))
+            self.messages.put(("confirm_page", page, order, reply, event))
             while not event.wait(.02):
                 check_stop(should_stop)
             check_stop(should_stop)
@@ -1634,7 +1792,7 @@ class App:
         def worker():
             try:
                 pause(0.6, should_stop)
-                do_fill(plan, self.calib, hwnd, self.messages.put, speed, should_stop, tr, probe, clipboard_owner, choose_version, confirm_page)
+                do_fill(plan, calib, hwnd, self.messages.put, speed, should_stop, tr, probe, clipboard_owner, choose_version, confirm_page)
             except Stopped:
                 self.messages.put(tr("已停下。", "Stopped."))
             except Exception as exc:
@@ -1680,11 +1838,18 @@ def portable_self_test(report_path):
         report["dpi_aware"] = True
         report["calibration_next_to_app"] = Path(CALIB_FILE).parent == application_file().parent
         with tempfile.TemporaryDirectory(prefix="preview-autofill-selftest-") as temp:
-            template = Path(temp) / "空白模板.xlsx"
-            write_template(template)
-            data = read_table(template, log=lambda _: None)
-            report["template_roundtrip"] = all(LANGS[0] in data[key] for key, _ in FIELDS)
-        report["ok"] = all(report[k] for k in ("dpi_aware", "calibration_next_to_app", "template_roundtrip"))
+            template = Path(temp) / "Template.xlsx"
+            for english, language in ((False, "简体中文"), (True, "English")):
+                write_template(template, english=english)
+                data = read_table(template, log=lambda _: None)
+                report[f"{language}_template_roundtrip"] = all(set(data[key]) == {language} for key, _ in FIELDS)
+        report["template_roundtrip"] = report["简体中文_template_roundtrip"] and report["English_template_roundtrip"]
+        text_preset, _ = load_calibration("text.json")
+        validate_calibration(text_preset)
+        media_preset, _ = load_calibration("media.json")
+        validate_media_calibration(media_preset, [("cover", 0, ""), ("image", 3, ""), ("video", 0, "")])
+        report["built_in_presets"] = True
+        report["ok"] = all(report[k] for k in ("dpi_aware", "calibration_next_to_app", "template_roundtrip", "built_in_presets"))
     except Exception as exc:
         report.update(ok=False, error=str(exc))
     finally:

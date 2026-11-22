@@ -136,6 +136,82 @@ class FillTests(unittest.TestCase):
         self.assertFalse(any(e[0] == 'clipboard' for e in self.events))
         self.assertTrue(any('stopped before clicking bottom cells' in line for line in self.logs))
 
+    def test_each_selected_version_row_is_used_for_all_languages(self):
+        c = calibration()
+        c['version_selector'] = {'dropdown': [.5, .25],
+                                 'options': {str(row): [.5, .3 + row * .04] for row in range(1, 5)}}
+        plan = tool.build_plan({'version': {lang: 'Update' for lang in tool.LANGS[:2]}}, tool.LANGS[:2], ['version'])
+        for row in range(1, 5):
+            self.events.clear()
+            tool.do_fill(plan, c, 42, self.logs.append, choose_version=True, version_row=row, confirm_page=lambda _: True)
+            clicks = [point for event, point in self.events if event == 'click']
+            self.assertEqual(clicks.count((.5, .3 + row * .04)), 2)
+            self.assertEqual(len([text for event, text in self.events if event == 'clipboard']), 2)
+
+    def test_version_probe_checks_normal_cells_then_leaves_one_dropdown_open(self):
+        c = calibration()
+        c['version_selector'] = {'dropdown': [.5, .25], 'options': {'4': [.5, .46]}}
+        languages = ['简体中文', 'Tiếng Việt']
+        plan = tool.build_plan({'name': {lang: 'Name' for lang in languages},
+                                'version': {lang: 'Must not paste' for lang in languages}},
+                               languages, ['name', 'version'])
+        pages = []
+        tool.do_fill(plan, c, 42, self.logs.append, probe=True, choose_version=True,
+                     version_row=4, confirm_page=lambda page: pages.append(page) or True)
+        self.assertEqual(pages, ['top', 'bottom'])
+        clicks = [point for event, point in self.events if event == 'click']
+        self.assertEqual(len(clicks), 2)  # outer pencil and dropdown only
+        self.assertEqual(clicks[0][0], .85)
+        self.assertAlmostEqual(clicks[0][1], .41)  # stay on the page already checked
+        self.assertEqual(clicks[-1], (.5, .25))
+        event, last_cell = self.events[self.events.index(('click', clicks[0])) - 1]
+        self.assertEqual(event, 'move')
+        self.assertAlmostEqual(last_cell[1], .4)
+        self.assertEqual(self.events[-1], ('move', (.5, .46)))
+        self.assertFalse(any(event in ('clipboard', 'keys') for event, _ in self.events))
+        self.assertTrue(any('下拉第 4 行' in log for log in self.logs))
+
+    def test_failed_version_action_does_not_try_to_close_unknown_dialog(self):
+        c = calibration()
+        c['version_selector'] = {'dropdown': [.5, .25], 'options': {'2': [.5, .38]}}
+        plan = tool.build_plan({'version': {'简体中文': 'Update'}}, ['简体中文'], ['version'])
+        for probe in (True, False):
+            with self.subTest(probe=probe), patch.object(tool, 'click', side_effect=[None, OSError('click failed')]):
+                self.events.clear()
+                tool.do_fill(plan, c, 42, self.logs.append, probe=probe, choose_version=True,
+                             version_row=2, confirm_page=lambda _: True)
+                self.assertIn('版本操作中断', self.logs[-1])
+                self.assertFalse(any(event in ('clipboard', 'keys') for event, _ in self.events))
+
+    def test_stop_during_version_probe_never_selects_or_sends_cleanup_keys(self):
+        c = calibration()
+        c['version_selector'] = {'dropdown': [.5, .25], 'options': {'2': [.5, .38]}}
+        plan = tool.build_plan({'version': {'简体中文': 'test'}}, ['简体中文'], ['version'])
+        def move(x, y):
+            self.events.append(('move', (x, y)))
+            if (x, y) == (.5, .38):
+                self.stop = True
+        with patch.object(tool, 'move_to', side_effect=move):
+            tool.do_fill(plan, c, 42, self.logs.append, probe=True, choose_version=True,
+                         version_row=2, should_stop=lambda: self.stop, confirm_page=lambda _: True)
+        self.assertFalse(any(event in ('keys', 'clipboard') for event, _ in self.events))
+        self.assertNotIn(('click', (.5, .38)), self.events)
+
+    def test_keep_current_version_does_not_require_selector_or_open_dropdown(self):
+        plan = tool.build_plan({'version': {'简体中文': 'Update'}}, ['简体中文'], ['version'])
+        tool.do_fill(plan, calibration(), 42, self.logs.append, choose_version=True,
+                     version_row=0, confirm_page=lambda _: True)
+        clicks = [point for event, point in self.events if event == 'click']
+        self.assertEqual(len(clicks), 3)  # edit, text, confirm
+        self.assertIn(('clipboard', 'Update'), self.events)
+
+    def test_missing_version_target_is_rejected_before_any_input(self):
+        plan = tool.build_plan({'version': {'简体中文': 'Update'}}, ['简体中文'], ['version'])
+        with self.assertRaises(tool.CalibrationError):
+            tool.do_fill(plan, calibration(), 42, self.logs.append, choose_version=True,
+                         version_row=3, confirm_page=lambda _: True)
+        self.assertEqual(self.events, [])
+
     def test_accepted_wheel_without_page_confirmation_never_moves_to_cells(self):
         plan = tool.build_plan({'name': {tool.LANGS[9]: 'Test'}}, [tool.LANGS[9]], ['name'])
         tool.do_fill(plan, calibration(), 42, self.logs.append, tr=lambda cn, en: en,
@@ -270,6 +346,23 @@ class DataTests(unittest.TestCase):
             self.assertEqual(tool.validate_calibration(english)[:3], ("English", "简体中文", "繁體中文"))
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), original)
 
+    def test_old_custom_option_is_preserved_and_new_rows_use_a_complete_preset_pair(self):
+        import json
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'saved.json'
+            saved = calibration()
+            saved['version_selector'] = {'dropdown': [.41, .24], 'option': [.42, .52],
+                                          'options': {'2': [.42, .38]}}
+            path.write_text(json.dumps(saved), encoding='utf-8')
+            with patch.object(tool, 'CALIB_FILE', str(path)):
+                loaded, _ = tool.load_text_calibration('English')
+            self.assertEqual(tool.version_target(loaded, -1), ([.41, .24], [.42, .52]))
+            self.assertEqual(tool.version_target(loaded, 2), ([.41, .24], [.42, .38]))
+            preset, _ = tool.load_calibration('text.json')
+            self.assertEqual(tool.version_target(loaded, 3), tool.version_target(preset, 3))
+            self.assertNotEqual(tool.version_target(loaded, 3)[0], [.41, .24])
+            self.assertEqual(json.loads(path.read_text(encoding='utf-8')), saved)
+
     def test_clean_install_has_text_and_media_positions(self):
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
@@ -314,12 +407,14 @@ class DataTests(unittest.TestCase):
                      (20, 1): '控制设备', (20, 2): '键盘鼠标、触屏、手柄'}
             ws = tool._Worksheet('Sheet1', cells, 20, 2)
             with patch.object(tool, '_read_worksheet', return_value=ws):
-                data = tool.read_table(source, log=lambda _: None)
+                data, rows, active = tool.read_table_rows(source, log=lambda _: None)
             self.assertEqual(data['version'], {})
+            self.assertEqual((rows, active), ([], 16))
             cells[(18, 2)] = '实际更新说明'
             with patch.object(tool, '_read_worksheet', return_value=ws):
-                data = tool.read_table(source, log=lambda _: None)
+                data, rows, active = tool.read_table_rows(source, log=lambda _: None)
             self.assertEqual(data['version'][tool.LANGS[0]], '实际更新说明')
+            self.assertEqual((rows, active), ([18], 18))
 
     def test_clipboard_uses_full_width_pointer_and_transfers_ownership(self):
         text = '中文 한국어 日本語 😀'
@@ -341,6 +436,188 @@ class DataTests(unittest.TestCase):
 
 
 class WizardTests(unittest.TestCase):
+    def test_excel_update_row_applies_on_preview_and_fill_without_mixing_rows(self):
+        tool.enable_physical_pixels()
+        root = tool.tk.Tk(); root.withdraw()
+        app = tool.App(root)
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                workbook = Path(folder) / 'Update history.xlsx'
+                tool.write_template(workbook)
+                xml_path = 'xl/worksheets/sheet1.xml'
+                with zipfile.ZipFile(workbook) as book:
+                    parts = {member: book.read(member) for member in book.namelist()}
+                sheet = ET.fromstring(parts[xml_path])
+                namespace = '{' + tool._XLSX_NS['main'] + '}'
+                sheet_data = sheet.find(namespace + 'sheetData')
+                for row_number, values in ((18, {'A': '0.05', 'B': '第二条更新', 'D': 'Second update'}),
+                                           (19, {'A': 'Instructions: example only', 'D': 'Example only'}),
+                                           (20, {'A': '版本 0.04', 'D': 'Older update'}),
+                                           (22, {'A': '关卡标签', 'D': 'Metadata'})):
+                    row = ET.SubElement(sheet_data, namespace + 'row', r=str(row_number))
+                    for col, value in values.items():
+                        cell = ET.SubElement(row, namespace + 'c', r=f'{col}{row_number}', t='inlineStr')
+                        inline = ET.SubElement(cell, namespace + 'is')
+                        ET.SubElement(inline, namespace + 't').text = value
+                parts[xml_path] = ET.tostring(sheet)
+                with zipfile.ZipFile(workbook, 'w') as book:
+                    for member, content in parts.items():
+                        book.writestr(member, content)
+                original = workbook.read_bytes()
+
+                app.path.set(str(workbook))
+                app.sheet.set(tool._xlsx_sheets(workbook)[0])
+                app.preview()
+                self.assertEqual(app.update_text_row.get(), '16')
+                self.assertTrue(app.previous_update.instate(['disabled']))
+                row_controls = app.next_update.master.pack_slaves()
+                self.assertEqual(row_controls[row_controls.index(app.next_update) + 1], app.preview_button)
+                app.field_vars['version'].set(True)
+                app.content.texts['name']['简体中文'] = '临时名称'
+                app.version_row.set(4)
+                app.next_update.invoke()
+                self.assertEqual(app.update_text_row.get(), '18')
+                self.assertEqual({cell[1]: cell[-1] for cell in app.current_plan() if cell[2] == 'version'},
+                                 {'简体中文': '第二条更新', 'English': 'Second update'})
+                self.assertTrue(app.lang_checks[2].instate(['!disabled']))
+                panel = tool.ContentPreview(app)
+                panel.tree.selection_set(str(panel.rows.index(('English', 'version'))))
+                panel.select_item()
+                self.assertEqual(panel.editor.get('1.0', 'end-1c'), 'Second update')
+                panel.editor.delete('1.0', 'end')
+                panel.editor.insert('1.0', 'Reviewed update')
+                panel.next_update.invoke()
+                self.assertEqual(panel.update_box.get(), '20')
+                self.assertEqual(panel.editor.get('1.0', 'end-1c'), 'Older update')
+                self.assertEqual(app.update_text_row.get(), '18')
+                self.assertEqual(app.content.texts['version']['English'], 'Second update')
+                panel.previous_update.invoke()
+                self.assertEqual(panel.editor.get('1.0', 'end-1c'), 'Reviewed update')
+                panel.window.destroy()
+                self.assertEqual(app.update_text_row.get(), '18')
+                self.assertEqual(app.content.texts['version']['English'], 'Second update')
+
+                panel = tool.ContentPreview(app)
+                index = panel.update_box['values'].index('20')
+                panel.update_box.current(index)
+                panel.update_box.event_generate('<<ComboboxSelected>>')
+                self.assertEqual(panel.use_button.cget('text'), '使用第 20 行')
+                self.assertEqual(panel.editor.get('1.0', 'end-1c'), 'Older update')
+                panel.editor.delete('1.0', 'end')
+                panel.editor.insert('1.0', 'Chosen update')
+                panel.use_button.invoke()
+                self.assertEqual(app.update_text_row.get(), '20')
+                self.assertTrue(app.next_update.instate(['disabled']))
+                plan = app.current_plan()
+                self.assertEqual([cell[-1] for cell in plan if cell[2] == 'version'], ['Chosen update'])
+                self.assertIn('临时名称', [cell[-1] for cell in plan])
+                self.assertEqual(app.version_row.get(), 4)
+                self.assertEqual(workbook.read_bytes(), original)
+                app.previous_update.invoke()
+                self.assertEqual(app.update_text_row.get(), '18')
+                for invalid in ('0', '18.5', '1', '23'):
+                    with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                        app.update_text_row.set(invalid)
+                        app.current_plan()
+                app.update_text_row.set('20')
+                self.assertIn('Older update', [cell[-1] for cell in app.current_plan()])
+                app.update_text_row.set('18')
+                app.next_update.invoke()
+                self.assertEqual(app.update_text_row.get(), '20')
+                app.update_text_row.set('')
+                self.assertIn('Older update', [cell[-1] for cell in app.current_plan()])
+                self.assertEqual(app.update_text_row.get(), '20')
+        finally:
+            app.close()
+
+    def test_preview_has_native_maximize_and_restores_editor_state(self):
+        tool.enable_physical_pixels()
+        root = tool.tk.Tk(); root.withdraw()
+        app = tool.App(root)
+        app.content = tool.ContentSelection({'name': {'简体中文': '原文'}})
+        try:
+            panel = tool.ContentPreview(app)
+            root.update_idletasks()
+            get_style = tool._api(tool.user32, 'GetWindowLongW',
+                                  [tool.wintypes.HWND, ctypes.c_int], tool.wintypes.LONG)
+            hwnd = int(str(panel.window.frame()), 0)
+            self.assertTrue(get_style(hwnd, -16) & 0x00010000)  # WS_MAXIMIZEBOX
+            panel.editor.delete('1.0', 'end')
+            panel.editor.insert('1.0', '预览中的改动')
+            size = (panel.window.winfo_width(), panel.window.winfo_height())
+            panel.window.state('zoomed')
+            root.update_idletasks()
+            self.assertEqual(panel.window.state(), 'zoomed')
+            self.assertGreater(panel.window.winfo_height(), size[1])
+            panel.window.state('normal')
+            root.update_idletasks()
+            self.assertEqual((panel.window.winfo_width(), panel.window.winfo_height()), size)
+            self.assertEqual(panel.editor.get('1.0', 'end-1c'), '预览中的改动')
+            self.assertEqual(root.grab_current(), panel.window)
+            panel.apply()
+            self.assertIsNone(root.grab_current())
+            self.assertEqual(app.content.texts['name']['简体中文'], '预览中的改动')
+        finally:
+            app.close()
+
+    def test_content_preview_cancel_and_apply_match_the_next_fill_plan(self):
+        tool.enable_physical_pixels()
+        root = tool.tk.Tk(); root.withdraw()
+        app = tool.App(root)
+        original = {'name': {'简体中文': '原始名称'}, 'version': {'简体中文': 'v1\n含 空格'}}
+        try:
+            app.path.set('local.xlsx'); app.sheet.set('Stage')
+            app.content_source = ('local.xlsx', 'Stage')
+            app.content = tool.ContentSelection(original)
+            app.field_vars['version'].set(True)
+            panel = tool.ContentPreview(app)
+            panel.editor.delete('1.0', 'end'); panel.editor.insert('1.0', '取消的修改')
+            panel.commit(); panel.window.destroy()
+            self.assertEqual(app.current_plan()[0][-1], '原始名称')
+            panel = tool.ContentPreview(app)
+            panel.editor.delete('1.0', 'end'); panel.editor.insert('1.0', '本次名称')
+            panel.commit()
+            version_index = panel.rows.index(('简体中文', 'version'))
+            panel.tree.selection_set(str(version_index)); panel.select_item()
+            panel.enabled.set(False); panel.commit()
+            panel.apply()
+            self.assertEqual([cell[-1] for cell in app.current_plan()], ['本次名称'])
+            self.assertEqual(original['name']['简体中文'], '原始名称')
+            self.assertEqual(original['version']['简体中文'], 'v1\n含 空格')
+            app.ui_language.set('English'); app.translate_ui()
+            self.assertEqual(app.version_row.get(), 1)
+            self.assertEqual(app.version_box.get(), 'Dropdown row 1')
+        finally:
+            app.close()
+
+    def test_recapturing_one_version_row_preserves_table_other_rows_and_old_target(self):
+        import json
+        tool.enable_physical_pixels()
+        root = tool.tk.Tk(); root.withdraw()
+        app = tool.App(root)
+        c = calibration()
+        c['version_selector'] = {'dropdown': [.5, .25], 'option': [.5, .34],
+                                 'options': {'1': [.5, .34], '2': [.5, .38]}}
+        try:
+            with tempfile.TemporaryDirectory() as folder, \
+                 patch.object(tool, 'CALIB_FILE', str(Path(folder) / 'calib.json')), \
+                 patch.object(tool, 'geometry', return_value=((0, 0), (962, 564), 96)), \
+                 patch.object(app, 'log_geometry'):
+                wizard = tool.VersionCalibrationWizard(app, 42, c, 3)
+                self.assertEqual(len(wizard.steps), 2)
+                wizard.captured = {'version_dropdown': [.5, .25], 'version_option_3': [.5, .42]}
+                wizard.save()
+                if not Path(tool.CALIB_FILE).exists():
+                    self.fail(wizard.status.cget('text'))
+                saved = json.loads(Path(tool.CALIB_FILE).read_text(encoding='utf-8'))
+                self.assertEqual(saved['top'], c['top'])
+                self.assertEqual(saved['dialogs'], c['dialogs'])
+                self.assertEqual(saved['version_selector']['option'], [.5, .34])
+                self.assertEqual(saved['version_selector']['options']['1'], [.5, .34])
+                self.assertEqual(saved['version_selector']['options']['3'], [.5, .42])
+        finally:
+            app.close()
+
     def test_back_cancels_pending_capture_and_keeps_recorded_points(self):
         tool.enable_physical_pixels()
         root = tool.tk.Tk()

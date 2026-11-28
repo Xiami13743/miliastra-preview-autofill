@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-APP_VERSION = "0.3.11"
+APP_VERSION = "0.3.12"
 APP_TITLE = f"千星奇域-预览信息-一键填写 v{APP_VERSION}"
 
 
@@ -91,6 +91,17 @@ _api(user32, "EnumChildWindows", [wintypes.HWND, ENUMPROC, wintypes.LPARAM], win
 _api(user32, "IsWindow", [wintypes.HWND], wintypes.BOOL)
 _api(user32, "IsWindowEnabled", [wintypes.HWND], wintypes.BOOL)
 _api(user32, "GetAncestor", [wintypes.HWND, wintypes.UINT], wintypes.HWND)
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+
+_api(user32, "MonitorFromWindow", [wintypes.HWND, wintypes.DWORD], wintypes.HMONITOR)
+_api(user32, "GetMonitorInfoW", [wintypes.HMONITOR, ctypes.POINTER(MONITORINFO)], wintypes.BOOL)
+_api(user32, "SetWindowPos", [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_int, wintypes.UINT], wintypes.BOOL)
 
 
 class GUITHREADINFO(ctypes.Structure):
@@ -384,7 +395,7 @@ def version_row_label(row, tr):
     if row == -1:
         return tr("原校准选项", "Original calibrated option")
     if row == 0:
-        return tr("保持当前版本", "Keep current version")
+        return tr("当前版本", "Current version")
     return tr(f"下拉第 {row} 行", f"Dropdown row {row}")
 
 
@@ -425,7 +436,7 @@ def checked_cell_point(calib, index, key):
 def build_plan(texts, langs, fields, first_language="简体中文"):
     return [(i, lang, key, cn, texts[key][lang])
             for i, lang in enumerate(stage_language_order(first_language)) if lang in langs
-            for key, cn in FIELDS if key in fields and texts.get(key, {}).get(lang)]
+            for key, cn in FIELDS if key in fields and (texts.get(key, {}).get(lang) or "").strip()]
 
 
 class ContentSelection:
@@ -533,7 +544,9 @@ def validate_captured_spacing(captured, key, size, first_language="简体中文"
                 f"Bottom spacing {row * size[1]:.1f}px differs from top {top_row * size[1]:.1f}px. Keep the list in place and capture {second} immediately below {first}.", key)
 
 
-def do_fill(plan, calib, hwnd, log, speed=1.0, should_stop=lambda: False, tr=lambda cn, en: cn, probe=False, clipboard_owner=None, choose_version=False, confirm_page=None, version_row=-1):
+def do_fill(plan, calib, hwnd, log, speed=1.0, should_stop=lambda: False, tr=lambda cn, en: cn, probe=False,
+            clipboard_owner=None, choose_version=False, confirm_page=None, version_row=-1,
+            *, wait_if_paused=lambda: False):
     order = validate_calibration(calib)
     if any(not 0 <= index < len(order) or order[index] != lang for index, lang, _, _, _ in plan):
         raise CalibrationError("待填写语言的行序与校准不一致，请检查首行语言。",
@@ -553,19 +566,25 @@ def do_fill(plan, calib, hwnd, log, speed=1.0, should_stop=lambda: False, tr=lam
     page_now = None
     errors = 0
 
-    def check_game():
-        check_stop(should_stop)
+    def stop_before_input():
+        if should_stop():
+            return True
         if user32.GetForegroundWindow() != hwnd:
             raise Stopped(tr("游戏失去焦点", "Game lost focus"))
+        return False
+
+    def check_game():
+        check_stop(stop_before_input)
 
     def act(point):
         check_game()
         if not all(0 < n < 1 for n in point):
             raise Stopped(tr("落点超出客户区，已停止。", "Target outside client area; stopped."))
-        click(*screen_point(point, hwnd), should_stop)
+        click(*screen_point(point, hwnd), stop_before_input)
 
     try:
         for number, (index, lang, key, cn, text) in enumerate(plan, 1):
+            wait_if_paused()
             check_game()
             language_index = LANGS.index(lang)
             language_name = tr(LANG_NAMES_CN[language_index], LANG_NAMES_EN[language_index])
@@ -582,10 +601,13 @@ def do_fill(plan, calib, hwnd, log, speed=1.0, should_stop=lambda: False, tr=lam
                     # Saturate at a boundary; never accumulate scroll deltas between runs.
                     for direction in ([1] if page == "top" else [1, -1]):
                         for _ in range(15):
-                            check_stop(should_stop)
+                            if wait_if_paused():
+                                move_to(*screen_point(hover, hwnd))
+                            check_game()
                             scroll_notch(direction)
                             pause(0.12, should_stop)
                         pause(0.35 * speed, should_stop)
+                    wait_if_paused()
                     log(tr("滚轮已发送，等待核对实际页面；不会直接按下一屏坐标定位。", "Wheel input sent. Waiting for actual page verification before moving to row coordinates."))
                     if confirm_page is None or not confirm_page(page):
                         raise Stopped(tr("页面未确认，已停止后续定位与填写。", "Page not confirmed; stopped before further positioning or filling."))
@@ -594,6 +616,7 @@ def do_fill(plan, calib, hwnd, log, speed=1.0, should_stop=lambda: False, tr=lam
                         raise Stopped(tr("无法重新激活游戏窗口。", "Cannot reactivate the game window."))
                     pause(.2, should_stop)
                     page_now = page
+                    wait_if_paused()
                 point = checked_cell_point(calib, index, key)
                 if probe:
                     if key == "version":
@@ -615,13 +638,13 @@ def do_fill(plan, calib, hwnd, log, speed=1.0, should_stop=lambda: False, tr=lam
                         log(prefix)
                         pause(0.8, should_stop)
                     continue
-                log(prefix + tr(f"（{len(text)} 字）", f" ({len(text)} characters)"))
+                log(prefix + " · " + length_label(lang, key, text, tr))
                 act(point)
                 modal_open = key != "name"
                 pause(0.35 * speed, should_stop)
                 if key == "name":
-                    replace_text(text, should_stop, clipboard_owner)
-                    check_stop(should_stop)
+                    replace_text(text, stop_before_input, clipboard_owner)
+                    check_game()
                     combo("enter")
                 elif key == "version":
                     # The edit button opens a version selector + description dialog.
@@ -632,11 +655,11 @@ def do_fill(plan, calib, hwnd, log, speed=1.0, should_stop=lambda: False, tr=lam
                         act(target[1])
                         pause(0.22, should_stop)
                     act(calib["dialogs"]["version"]["text"])
-                    replace_text(text, should_stop, clipboard_owner)
+                    replace_text(text, stop_before_input, clipboard_owner)
                     act(calib["dialogs"]["version"]["confirm"])
                 else:
                     act(calib["dialogs"][key]["text"])
-                    replace_text(text, should_stop, clipboard_owner)
+                    replace_text(text, stop_before_input, clipboard_owner)
                     act(calib["dialogs"][key]["confirm"])
                 pause(0.35 * speed, should_stop)
             except Stopped:
@@ -718,11 +741,36 @@ LANG_HINTS["日本語"] += ["日文", "日語"]
 FIELDS = [("name", "关卡名称"), ("notes", "玩法说明"), ("desc", "关卡描述"), ("version", "版本更新记录")]
 FIELD_NAMES_EN = {"name": "Stage Name", "notes": "Gameplay Details",
                   "desc": "Stage Description", "version": "Update Log"}
+LATIN_LANGUAGES = {"English", "Español", "Français", "Tiếng Việt", "Deutsch",
+                   "Indonesia", "Italiano", "Português", "Türkçe"}
+TEXT_LIMITS = {"notes": 200, "desc": 5000, "version": 1000}
+CHECKED_LENGTH_FIELDS = {"name", "version"}
 FIELD_ALIASES = {key: (cn, FIELD_NAMES_EN[key].casefold()) for key, cn in FIELDS}
 FIELD_ALIASES["name"] += ("level name",)
 FIELD_ALIASES["notes"] += ("gameplay instructions",)
 FIELD_ALIASES["desc"] += ("level description",)
 FIELD_ALIASES["version"] += ("version history",)
+
+
+def field_text_length(lang, key, text):
+    # Count each line break once. Combining marks and spaces still occupy a code point.
+    count = len(text.replace("\r\n", "\n").replace("\r", "\n"))
+    latin = lang in LATIN_LANGUAGES
+    if key == "name":
+        return count, 20 if latin else 10
+    if key == "version":
+        return count / 2 if latin else count, TEXT_LIMITS[key]
+    # The game shows the cap for these fields. Its per-language counting rule is unverified.
+    return count, TEXT_LIMITS[key]
+
+
+def length_label(lang, key, text, tr):
+    used, limit = field_text_length(lang, key, text)
+    if key == "version":
+        return tr(f"{used:g}/{limit} 字宽", f"{used:g}/{limit} width")
+    if key == "name":
+        return tr(f"{used}/{limit} 字符", f"{used}/{limit} characters")
+    return tr(f"{used} 字符 · 游戏上限 {limit}", f"{used} characters · game limit {limit}")
 
 
 # ---------------------------------------------------------------- 读表（不写死行号、列号）
@@ -844,11 +892,21 @@ def read_table(path, sheet=None, log=print, *, update_row=None, tr=lambda cn, en
 
 def read_table_rows(path, sheet=None, log=print, *, update_row=None, tr=lambda cn, en: cn):
     """Return the text, the rows with update text, and the selected update row."""
+    texts, rows, active, _ = _read_table_snapshot(path, sheet, log, update_row=update_row, tr=tr)
+    return texts, rows, active
+
+
+def _read_table_snapshot(path, sheet, log, *, update_row, tr, require_sheet=False):
     with zipfile.ZipFile(path) as book:
         sheet_defs = _read_workbook(book)
         if not sheet_defs:
             raise ValueError("工作簿中没有可读取的工作表 / No readable worksheets in this workbook")
-        selected = next((item for item in sheet_defs if item[0] == sheet), sheet_defs[0])
+        selected = next((item for item in sheet_defs if item[0] == sheet), None)
+        if selected is None:
+            if require_sheet:
+                raise ValueError(tr(f"文件中找不到工作表「{sheet}」。请用①重新打开。",
+                                    f"Worksheet “{sheet}” is missing. Reopen the workbook with ①."))
+            selected = sheet_defs[0]
         ws = _read_worksheet(book, selected[0], selected[1], _read_shared_strings(book))
 
         # 1) 表头找语言列（头 3 行里找）
@@ -933,10 +991,10 @@ def read_table_rows(path, sheet=None, log=print, *, update_row=None, tr=lambda c
                 for r in range(r0, end):
                     v = ws.cell(r, col)
                     if isinstance(v, str) and v.strip():
-                        out[k][lang] = v.strip()
+                        out[k][lang] = v
                         break
         log(f"工作表「{ws.title}」：字段行 {label_row}，语言列 {lang_col}")
-        return out, update_rows, update_row
+        return out, update_rows, update_row, tuple(name for name, _ in sheet_defs)
 
 
 def write_template(path, english=False):
@@ -1729,6 +1787,26 @@ def neighbouring_update_rows(rows, current):
     return previous, following
 
 
+def place_on_game_monitor_right(window, game):
+    monitor = user32.MonitorFromWindow(game, 2)  # MONITOR_DEFAULTTONEAREST
+    info = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    # Tk's negative geometry offsets are relative to the screen edges. Move the
+    # actual wrapper in Win32 physical coordinates, including left-hand monitors.
+    window.update_idletasks()
+    hwnd = user32.GetAncestor(window.winfo_id(), 2)  # GA_ROOT
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    width, height = rect.right - rect.left, rect.bottom - rect.top
+    work = info.rcWork
+    x = max(work.left, work.right - width - 12)
+    y = max(work.top, work.top + (work.bottom - work.top - height) // 2)
+    if not user32.SetWindowPos(hwnd, None, x, y, 0, 0, 0x0015):  # NOSIZE | NOZORDER | NOACTIVATE
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
 class ContentPreview:
     """Review and edit a copy; Cancel discards it, Apply uses it for subsequent runs."""
     def __init__(self, app):
@@ -1752,7 +1830,8 @@ class ContentPreview:
         self.window.columnconfigure(0, weight=1)
         self.window.rowconfigure(1, weight=3)
         self.window.rowconfigure(3, weight=2)
-        self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
+        self.window.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.window.bind("<Escape>", self.cancel)
         top = ttk.Frame(self.window, padding=8); top.grid(row=0, column=0, sticky="ew")
         if self.show_versions:
             self.build_update_picker(top)
@@ -1767,11 +1846,12 @@ class ContentPreview:
         table.rowconfigure(0, weight=1); table.columnconfigure(0, weight=1)
         self.tree = ttk.Treeview(table, columns=("use", "language", "field", "count", "text"), show="headings", selectmode="browse", height=10)
         for key, cn, en, width in (("use", "填写", "Fill", 48), ("language", "语言", "Language", 110),
-                                    ("field", "字段", "Field", 120), ("count", "字符", "Chars", 50),
+                                    ("field", "字段", "Field", 120), ("count", "长度", "Length", 92),
                                     ("text", "内容预览", "Content Preview", 440)):
             self.tree.heading(key, text=self.tr(cn, en))
             self.tree.column(key, width=width, minwidth=40, stretch=key == "text")
         self.tree.tag_configure("skipped", foreground="#555555")
+        self.tree.tag_configure("over_limit", foreground="#a32118")
         self.tree.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
         scrollbar.grid(row=0, column=1, sticky="ns"); self.tree.configure(yscrollcommand=scrollbar.set)
@@ -1790,8 +1870,8 @@ class ContentPreview:
         scroll.pack(side="right", fill="y"); self.editor.configure(yscrollcommand=scroll.set)
         self.editor.bind("<<Modified>>", self.edited)
         bottom = ttk.Frame(self.window, padding=8); bottom.grid(row=4, column=0, sticky="ew")
-        ttk.Label(bottom, text=self.tr("空白项会跳过；空格和换行计入字符数。", "Empty items are skipped; spaces and line breaks count as characters.")).pack(side="left")
-        ttk.Button(bottom, text=self.tr("取消", "Cancel"), command=self.window.destroy).pack(side="right")
+        ttk.Label(bottom, text=self.tr("空白项跳过。空格和换行计入长度。", "Blank items are skipped. Spaces and line breaks count.")).pack(side="left")
+        ttk.Button(bottom, text=self.tr("取消（Esc）", "Cancel (Esc)"), command=self.cancel).pack(side="right")
         self.use_button = ttk.Button(bottom, text=self.use_label(), command=self.apply)
         self.use_button.pack(side="right", padx=8)
         for i in range(len(self.rows)):
@@ -1879,10 +1959,18 @@ class ContentPreview:
         lang, key = self.rows[index]
         text = self.draft.texts.get(key, {}).get(lang, "")
         selected = (lang, key) not in self.draft.excluded
+        used, limit = field_text_length(lang, key, text)
+        count = f"{used:g}/{limit}" if key in CHECKED_LENGTH_FIELDS else str(used)
+        if not selected or not text.strip():
+            tags = ("skipped",)
+        elif key in CHECKED_LENGTH_FIELDS and used > limit:
+            tags = ("over_limit",)
+        else:
+            tags = ()
         language = self.tr(LANG_NAMES_CN[LANGS.index(lang)], LANG_NAMES_EN[LANGS.index(lang)])
         self.tree.item(str(index), values=("☑" if selected else "☐", language,
-                       self.tr(dict(FIELDS)[key], FIELD_NAMES_EN[key]), len(text), text.replace("\n", " ⏎ ")),
-                       tags=() if selected and text else ("skipped",))
+                       self.tr(dict(FIELDS)[key], FIELD_NAMES_EN[key]), count, text.replace("\n", " ⏎ ")),
+                       tags=tags)
 
     def update_summary(self):
         langs, fields = self.app.selected_filters()
@@ -1900,8 +1988,8 @@ class ContentPreview:
             self.draft.excluded.add((lang, key))
         self.render_item(self.active)
         text = self.draft.texts[key][lang]
-        self.item_label.configure(text=f"{lang} · {self.tr(dict(FIELDS)[key], FIELD_NAMES_EN[key])} · {len(text)} "
-                                  + self.tr("字符", "characters"))
+        label = length_label(lang, key, text, self.tr)
+        self.item_label.configure(text=f"{lang} · {self.tr(dict(FIELDS)[key], FIELD_NAMES_EN[key])} · {label}")
         self.update_summary()
 
     def select_item(self):
@@ -1960,6 +2048,10 @@ class ContentPreview:
             self.app.log(self.tr("已使用本次选择和修改。", "Using your preview selections and edits."))
         self.window.destroy()
 
+    def cancel(self, _=None):
+        self.window.destroy()
+        return "break"
+
 
 class App:
     def __init__(self, root):
@@ -1978,15 +2070,22 @@ class App:
         self.content_update_row = None
         self.update_rows = []
         self.update_text_row = tk.StringVar()
-        self.version_row = tk.IntVar(value=1)
+        self.version_row = tk.IntVar(value=0)
         self.busy = False
+        self.filling_text = False
+        self.fill_status = tk.StringVar()
+        self.pause_requested = threading.Event()
+        self.fill_paused = threading.Event()
+        self.pause_key_down = False
+        self.cancel_page_confirmation = None
         self.stop_event = threading.Event()
         self.messages = queue.Queue()
         self.widgets = []
         self.media_panel = None
         self._build()
+        self.refresh_run_status()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.root.after(30, self.drain)
+        self.drain_timer = self.root.after(30, self.drain)
 
     def tr(self, cn, en):
         return en if self.ui_language.get() == "English" else cn
@@ -2015,6 +2114,9 @@ class App:
         self.sheet_box = ttk.Combobox(f2, textvariable=self.sheet, width=24, state="readonly")
         self.sheet_box.pack(side="left", padx=6)
         self.sheet_box.bind("<<ComboboxSelected>>", lambda _: self.preview())
+        self.refresh_button = self.widget(ttk.Button, f2, "刷新表格", "Refresh workbook",
+                                          command=self.refresh_workbook, state="disabled")
+        self.refresh_button.pack(side="left")
         self.widget(ttk.Label, f2, "游戏首行（默认语言）", "Stage Default Language (Row 1)").pack(side="left", padx=(12, 0))
         ttk.Combobox(f2, textvariable=self.first_language, values=LANGS, width=12,
                      state="readonly").pack(side="left", padx=6)
@@ -2043,7 +2145,7 @@ class App:
         self.update_text_row.trace_add("write", self.refresh_update_buttons)
         version_bar = ttk.Frame(self.root); version_bar.pack(fill="x", **pad)
         self.widget(ttk.Label, version_bar, "游戏目标版本", "Game version").pack(side="left")
-        self.version_rows = (1, 2, 3, 4, 0, -1)
+        self.version_rows = (0, 2, 3, 4, -1)
         self.version_box = ttk.Combobox(version_bar, width=26, state="readonly",
                                         values=[version_row_label(row, self.tr) for row in self.version_rows])
         self.version_box.current(0); self.version_box.pack(side="left", padx=6)
@@ -2057,8 +2159,12 @@ class App:
             self.widget(ttk.Button, f5, cn, en, command=callback).pack(side="left", padx=3)
         f6 = ttk.Frame(self.root); f6.pack(fill="x", **pad)
         self.widget(ttk.Button, f6, "停止（F9）", "Stop (F9)", command=self.stop_event.set).pack(side="left")
-        self.widget(ttk.Label, f6, "  慢/快", "  Speed").pack(side="left")
-        ttk.Scale(f6, from_=0.5, to=3, variable=self.speed, length=110).pack(side="left")
+        self.widget(ttk.Label, f6, "慢", "Slow").pack(side="left", padx=(12, 4))
+        self.speed_scale = ttk.Scale(f6, from_=3, to=0.5, variable=self.speed, length=110)
+        self.speed_scale.pack(side="left")
+        self.widget(ttk.Label, f6, "快", "Fast").pack(side="left", padx=(4, 0))
+        self.widget(ttk.Label, f6, "F8 暂停 / 继续", "F8 Pause / Resume").pack(side="left", padx=(16, 8))
+        ttk.Label(f6, textvariable=self.fill_status).pack(side="left")
         self.widget(ttk.Checkbutton, self.root, "共用弹窗位置（千星，精简校准）", "Shared dialog positions (Miliastra, fewer steps)", variable=self.shared_dialog).pack(anchor="w", padx=10)
         self.logbox = tk.Text(self.root, height=18, wrap="word", state="disabled")
         self.logbox.pack(fill="both", expand=True, **pad)
@@ -2074,6 +2180,7 @@ class App:
         self.root.title(self.tr(APP_TITLE, f"Miliastra Preview Autofill v{APP_VERSION}"))
         self.version_box.configure(values=[version_row_label(row, self.tr) for row in self.version_rows])
         self.version_box.current(self.version_rows.index(self.version_row.get()))
+        self.refresh_run_status()
         if self.media_panel is not None:
             self.media_panel.window.title(self.tr("封面 / 展示图 / 视频", "Cover / Images / Video") + f" · v{APP_VERSION}")
         # Historic logs are a record; fresh logs use the newly selected language.
@@ -2090,46 +2197,134 @@ class App:
         self.logbox.see("end")
         self.logbox.configure(state="disabled")
 
+    def refresh_run_status(self):
+        refresh_state = "normal" if self.path.get() and not self.busy else "disabled"
+        sheet_state = "disabled" if self.busy else "readonly"
+        if str(self.refresh_button.cget("state")) != refresh_state:
+            self.refresh_button.configure(state=refresh_state)
+        if str(self.sheet_box.cget("state")) != sheet_state:
+            self.sheet_box.configure(state=sheet_state)
+        if not self.filling_text:
+            status = self.tr("就绪", "Ready") if not self.busy else ""
+        elif self.fill_paused.is_set():
+            status = self.tr("已暂停", "Paused")
+        elif self.pause_requested.is_set():
+            status = self.tr("暂停待生效", "Pausing…")
+        elif self.cancel_page_confirmation is not None:
+            status = self.tr("等待核对", "Waiting for confirmation")
+        else:
+            status = self.tr("填写中", "Filling")
+        if self.fill_status.get() != status:
+            self.fill_status.set(status)
+
+    def show_page_confirmation(self, hwnd, page, order, reply, event):
+        if page == "top":
+            heading = self.tr("将列表滚到最顶部，核对前 9 行的语言顺序。",
+                              "Scroll all the way up and check the order of the first nine rows.")
+            rows = order[:9]
+        else:
+            heading = self.tr("将列表滚到最底部，核对最后 6 行的语言顺序。",
+                              "Scroll all the way down and check the order of the last six rows.")
+            rows = order[9:]
+        instruction = self.tr("可直接在游戏里滚动。确认编辑弹窗已关闭、顺序一致后点确定。",
+                              "You can scroll in the game with this window open. Close any editors and click OK when the order matches.")
+        window = tk.Toplevel(self.root, name="page_confirmation")
+        window.withdraw()
+        window.title(self.tr("核对语言顺序", "Check Language Order"))
+        window.resizable(False, False)
+        window.attributes("-topmost", True)
+
+        def finish(ok):
+            self.cancel_page_confirmation = None
+            reply["ok"] = ok and not self.stop_event.is_set()
+            try:
+                window.destroy()
+            finally:
+                event.set()
+
+        def cancel(_=None):
+            finish(False)
+            return "break"
+
+        window.protocol("WM_DELETE_WINDOW", cancel)
+        window.bind("<Escape>", cancel)
+        body = ttk.Frame(window, padding=14)
+        body.pack(fill="both", expand=True)
+        for content in (heading, " → ".join(rows), instruction):
+            ttk.Label(body, text=content, wraplength=440, justify="left").pack(anchor="w", pady=(0, 9))
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text=self.tr("取消", "Cancel"), command=cancel).pack(side="right")
+        confirm = ttk.Button(buttons, text=self.tr("确定", "OK"), command=lambda: finish(True))
+        confirm.pack(side="right", padx=(0, 6))
+        window.bind("<Return>", lambda _: finish(True))
+        try:
+            window.deiconify()
+            place_on_game_monitor_right(window, hwnd)
+        except Exception:
+            window.destroy()
+            raise
+        confirm.focus_set()
+        self.cancel_page_confirmation = cancel
+
+        def move_pointer(_=None):
+            if not confirm.winfo_ismapped():
+                return
+            confirm.unbind("<Map>")
+            rect = wintypes.RECT()
+            if not self.stop_event.is_set() and user32.GetWindowRect(confirm.winfo_id(), ctypes.byref(rect)):
+                try:
+                    move_to((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+                except OSError as exc:
+                    self.log(self.tr("鼠标定位失败：", "Could not position the pointer: ") + str(exc))
+
+        # Tk creates the button's HWND before packing it at its visible size.
+        confirm.bind("<Map>", move_pointer)
+        move_pointer()
+
     def drain(self):
         if self.busy and user32.GetAsyncKeyState(0x78) & 0x8000:
             self.stop_event.set()
+        key_down = bool(user32.GetAsyncKeyState(0x77) & 0x8000)
+        if self.filling_text and key_down and not self.pause_key_down and not self.stop_event.is_set():
+            if self.pause_requested.is_set():
+                self.pause_requested.clear()
+            else:
+                self.pause_requested.set()
+        self.pause_key_down = key_down
+        if self.stop_event.is_set() and self.cancel_page_confirmation is not None:
+            self.cancel_page_confirmation()
         try:
             while True:
                 message = self.messages.get_nowait()
                 if message is None:
                     self.busy = False
+                    self.filling_text = False
+                    self.pause_requested.clear()
                 elif isinstance(message, tuple) and message[0] == "confirm_page":
-                    _, page, order, reply, event = message
+                    _, hwnd, page, order, reply, event = message
                     try:
                         if self.stop_event.is_set():
-                            reply["ok"] = False
+                            event.set()
                         else:
-                            if page == "top":
-                                heading = self.tr("将列表滚到最顶部，核对前 9 行的语言顺序。",
-                                                  "Scroll all the way up and check the order of the first nine rows.")
-                                rows = order[:9]
-                            else:
-                                heading = self.tr("将列表滚到最底部，核对最后 6 行的语言顺序。",
-                                                  "Scroll all the way down and check the order of the last six rows.")
-                                rows = order[9:]
-                            instruction = self.tr("先关闭打开的编辑弹窗。顺序相同才点确定。如果顺序不同，请取消并检查游戏首行和已添加的语言。",
-                                                  "Close any open editors. Click OK only if the order matches. If it differs, cancel and check the stage's first row and added languages.")
-                            reply["ok"] = messagebox.askokcancel(
-                                self.tr("核对语言顺序", "Check Language Order"),
-                                f"{heading}\n\n{' → '.join(rows)}\n\n{instruction}", parent=self.root)
-                    finally:
+                            self.show_page_confirmation(hwnd, page, order, reply, event)
+                    except (OSError, tk.TclError) as exc:
+                        self.log(self.tr("打开核对窗口失败：", "Could not open the confirmation window: ") + str(exc))
                         event.set()
                 else:
                     self.log(message)
         except queue.Empty:
             pass
-        self.root.after(30, self.drain)
+        self.refresh_run_status()
+        self.drain_timer = self.root.after(30, self.drain)
 
     def error(self, exc, parent=None):
         owner = parent if parent is not None else self.root
         messagebox.showerror(owner.title(), exc.localized(self.tr) if isinstance(exc, CalibrationError) else str(exc), parent=owner)
 
     def pick_file(self):
+        if self.busy:
+            return
         path = filedialog.askopenfilename(title=self.tr("选 Excel", "Choose Excel"), filetypes=[("Excel", "*.xlsx *.xlsm"), (self.tr("全部", "All files"), "*.*")])
         if not path:
             return
@@ -2144,7 +2339,7 @@ class App:
             self.error(exc)
 
     def preview(self):
-        if not self.path.get():
+        if self.busy or not self.path.get():
             return
         try:
             self.load_content(reload=True)
@@ -2154,6 +2349,29 @@ class App:
                 self.log(self.tr(cn, FIELD_NAMES_EN[key]) + self.tr(f"：{len(got)} 种语言（", f": {len(got)} languages (") + ", ".join(got) + ")")
         except Exception as exc:
             self.error(exc)
+
+    def refresh_workbook(self):
+        source = (self.path.get(), self.sheet.get())
+        if self.busy or not source[0]:
+            return
+        try:
+            texts, rows, selected_row, sheets = _read_table_snapshot(
+                *source, log=lambda _: None, update_row=self.selected_update_row(), tr=self.tr, require_sheet=True)
+        except (PermissionError, zipfile.BadZipFile):
+            self.error(ValueError(self.tr("暂时无法读取 Excel，请等保存完成后再刷新。",
+                                         "The workbook could not be read. Finish saving it and try Refresh workbook again.")))
+            return
+        except Exception as exc:
+            self.error(exc)
+            return
+        excluded = self.content.excluded if self.content is not None and self.content_source == source else ()
+        self.content = ContentSelection(texts, excluded)
+        self.content_source = source
+        self.sheet_box.configure(values=sheets)
+        self.update_rows = rows
+        self.set_content_row(selected_row)
+        row_note = self.tr(f" · Excel 第 {selected_row} 行", f" · Excel row {selected_row}") if selected_row is not None else ""
+        self.log(self.tr(f"已刷新工作表「{source[1]}」", f"Refreshed worksheet “{source[1]}”") + row_note)
 
     def load_content(self, update_row=None, *, reload=False):
         source = (self.path.get(), self.sheet.get())
@@ -2181,7 +2399,7 @@ class App:
         self.refresh_language_checks()
 
     def refresh_language_checks(self):
-        detected = {lang for values in self.content.texts.values() for lang, value in values.items() if value}
+        detected = {lang for values in self.content.texts.values() for lang, value in values.items() if value and value.strip()}
         for lang, check in zip(LANGS, self.lang_checks):
             check.configure(state="normal" if lang in detected else "disabled")
 
@@ -2231,6 +2449,24 @@ class App:
             self.load_content(self.selected_update_row())
         return self.content.plan(langs, fields, self.first_language.get())
 
+    def check_text_lengths(self, plan):
+        errors = []
+        for _, lang, key, cn, text in plan:
+            used, limit = field_text_length(lang, key, text)
+            if used <= limit:
+                continue
+            detail = f"{lang} · {self.tr(cn, FIELD_NAMES_EN[key])} · {length_label(lang, key, text, self.tr)}"
+            if key in CHECKED_LENGTH_FIELDS:
+                errors.append(detail)
+            else:
+                self.log(self.tr("请核对游戏内长度：", "Check this length in the game: ") + detail)
+        if errors:
+            if len(errors) > 6:
+                errors = errors[:6] + [self.tr(f"另有 {len(errors) - 6} 格超限。", f"{len(errors) - 6} more cells exceed the limit.")]
+            raise ValueError(self.tr("以下内容超限。请在「选择 / 预览内容」中修改后再填。",
+                                     "These entries exceed the limit. Edit them in Select / Preview before filling.")
+                             + "\n\n" + "\n".join(errors))
+
     def open_content(self):
         if self.busy:
             return
@@ -2254,16 +2490,18 @@ class App:
 
     def help(self):
         messagebox.showinfo(self.root.title(), self.tr(
-            "1. 点「导出 Excel 模板」。在各语言列的第 2、9、12、16 行填写关卡资料，保留表头，首次发布请清空第 16 行示例。保存后用①打开并选工作表。\n\n"
+            "1. 点「导出 Excel 模板」。在各语言列的第 2、9、12、16 行填写关卡资料，保留表头，首次发布请清空第 16 行示例。保存后用①打开并选工作表。修改表格后，保存并点「刷新表格」。\n\n"
             "2. 在游戏里打开关卡详情页的多语言设置。如果语言未齐，通过「添加语言 → 全选」启用 15 种语言。滚到顶部，在工具里选择游戏首行标着「默认」的语言。\n\n"
-            "3. 点④，使用已保存或内置的坐标核对两屏语言顺序和鼠标落点。落点偏移时点③。每次点「采集当前点」后，在 5 秒内把鼠标移到指定单元格、图标或保存按钮的中心并停住。\n\n"
-            "4. 点「下一条」右边的「选择 / 预览内容」。窗口可最大化，也可逐格勾选和修改文字。勾选「版本更新记录」后，预览顶部可切换 Excel 行，点「使用第 N 行」确认这一行和本次修改。\n\n"
-            "5. 更新已发布关卡时勾选「版本更新记录」。工具自动显示 Excel 文案行号，点「上一条 / 下一条」切换，也可直接输入行号。再选游戏目标版本。④会最后展开下拉并停在所选行。核对后点版本弹窗右上角 × 回到多语言列表，再点⑤填写。首次发布保持版本记录未勾选。F9 停止。",
-            "1. Click Export Excel Template. Enter your stage info in the language columns on rows 2, 9, 12 and 16. Keep the headers and clear the row 16 example for a first release. Save the workbook, open it with ① and select a worksheet.\n\n"
+            "3. 点④，使用已保存或内置的坐标核对两屏语言顺序和鼠标落点。游戏列表可在右侧核对窗打开时手动滚动。落点偏移时点③，在 5 秒内将鼠标停在指定单元格、图标或保存按钮的中心。\n\n"
+            "4. 点「下一条」右边的「选择 / 预览内容」，逐格核对长度、勾选或修改，按 Esc 放弃本次修改。勾选「版本更新记录」后，可在预览顶部切换 Excel 行，点「使用第 N 行」确认。\n\n"
+            "5. 更新已发布关卡时勾选「版本更新记录」，选 Excel 文案行和游戏目标版本。「当前版本」直接用弹窗当前显示的版本，第 2～4 行会展开下拉。④核对后点版本弹窗右上角 × 回到列表。首次发布保持版本记录未勾选。\n\n"
+            "6. 点⑤填写。按 F8 会在当前格完成后暂停，再按 F8 从下一格继续。暂停时请保持游戏页面原位。F9 停止。",
+            "1. Click Export Excel Template. Enter your stage info in the language columns on rows 2, 9, 12 and 16. Keep the headers and clear the row 16 example for a first release. Save it and use ① to open it and select a worksheet. After saving changes in Excel, click Refresh workbook.\n\n"
             "2. Open Stage Details > Multilanguage Settings in Genshin Impact. If any languages are missing, use Add Language > Select All > OK to enable all 15. Scroll to the top and set Stage Default Language (Row 1) in the tool to the language marked Default in the game.\n\n"
-            "3. Use ④ Check positions to verify the row order and pointer targets with saved or built-in positions. If a target is off, open ③ Calibrate. Click Capture and move the pointer to the center of the indicated cell, icon, or OK button within five seconds. Hold it there until the timer ends.\n\n"
-            "4. Click Select / Preview next to Next update. You can maximize the window and edit individual entries. With Update Log selected, use the row controls at the top of the preview. Click Use row N to apply that row and your edits.\n\n"
-            "5. For a published stage, select Update Log. The tool displays the worksheet row it reads. Click Previous update or Next update, or type a row number. Then choose the Game version. ④ opens the version dropdown at the end and points to the chosen row. After checking it, use the editor's × to return to the language list before ⑤. Leave Update Log unchecked for a first release. Press F9 to stop."))
+            "3. Use ④ to verify the row order and pointer targets. You can scroll the game while the confirmation window is on the right. To adjust a target, use ③ Calibrate. Click Capture, then hold the pointer at the center of the indicated cell, icon, or OK button within five seconds.\n\n"
+            "4. Click Select / Preview next to Next update to check lengths, select, or edit entries. Press Esc to discard changes to this preview. With Update Log selected, use the row controls and click Use row N to apply that row.\n\n"
+            "5. For a published stage, select Update Log and choose the Excel text row and the Game version. Current version uses the version shown when the editor opens. Rows 2–4 use the dropdown. Use the editor's × to return to the list after ④. Leave Update Log unchecked for a first release.\n\n"
+            "6. Click ⑤ Fill all. Press F8 to pause after the current cell and F8 again to continue with the next cell. Leave the game page in place while paused. F9 stops."))
 
     def game(self):
         hwnd = find_game_window()
@@ -2329,9 +2567,11 @@ class App:
             except (OSError, ValueError, TypeError) as exc:
                 raise ValueError(self.tr("校准文件无法读取，请点③重新校准。", "The calibration file is invalid. Use ③ to calibrate again.")) from exc
             order = validate_calibration(calib)
-            plan = self.current_plan()
+            plan = tuple(self.current_plan())
             if not plan:
                 raise ValueError(self.tr("按现在的勾选没有可填的内容。", "No content matches the current selection."))
+            if not probe:
+                self.check_text_lengths(plan)
             hwnd = self.game()
             size = self.log_geometry(hwnd)
             if from_preset:
@@ -2352,13 +2592,16 @@ class App:
             return
         self.busy = True
         self.stop_event.clear()
+        self.pause_requested.clear()
+        self.filling_text = not probe
+        self.refresh_run_status()
         # Freeze UI settings on the Tk thread; worker never reads/writes Tk objects.
         english = self.ui_language.get() == "English"
         tr = lambda cn, en: en if english else cn
         speed = self.speed.get()
         clipboard_owner = self.root.winfo_id()
-        self.log(tr("核对落点。若有版本记录，最后停在版本弹窗。F9 停止。" if probe else f"开始填 {len(plan)} 格。F9随时停止。",
-                    "Checking positions. If Update Log is included, its editor stays open at the end. F9 stops." if probe else f"Filling {len(plan)} cells. Press F9 to stop at any time."))
+        self.log(tr("核对落点。若有版本记录，最后停在版本弹窗。F9 停止。" if probe else f"开始填 {len(plan)} 格。F8 暂停 / 继续，F9 停止。",
+                    "Checking positions. If Update Log is included, its editor stays open at the end. F9 stops." if probe else f"Filling {len(plan)} cells. F8 pauses or resumes. F9 stops."))
         versions = sum(cell[2] == "version" for cell in plan)
         if versions:
             row = self.content_update_row
@@ -2369,9 +2612,26 @@ class App:
             if user32.GetAsyncKeyState(0x78) & 0x8000:
                 self.stop_event.set()
             return self.stop_event.is_set()
+
+        def wait_if_paused():
+            if not self.pause_requested.is_set():
+                return False
+            self.fill_paused.set()
+            try:
+                while self.pause_requested.is_set():
+                    pause(.03, should_stop)
+                check_stop(should_stop)
+                if user32.GetForegroundWindow() != hwnd:
+                    if not user32.SetForegroundWindow(hwnd):
+                        raise Stopped(tr("恢复时无法激活游戏窗口。", "Cannot reactivate the game window on resume."))
+                    pause(.15, should_stop)
+            finally:
+                self.fill_paused.clear()
+            return True
+
         def confirm_page(page):
             event, reply = threading.Event(), {}
-            self.messages.put(("confirm_page", page, order, reply, event))
+            self.messages.put(("confirm_page", hwnd, page, order, reply, event))
             while not event.wait(.02):
                 check_stop(should_stop)
             check_stop(should_stop)
@@ -2379,7 +2639,8 @@ class App:
         def worker():
             try:
                 pause(0.6, should_stop)
-                do_fill(plan, calib, hwnd, self.messages.put, speed, should_stop, tr, probe, clipboard_owner, choose_version, confirm_page, version_row)
+                do_fill(plan, calib, hwnd, self.messages.put, speed, should_stop, tr, probe, clipboard_owner,
+                        choose_version, confirm_page, version_row, wait_if_paused=wait_if_paused)
             except Stopped:
                 self.messages.put(tr("已停下。", "Stopped."))
             except Exception as exc:
@@ -2396,6 +2657,9 @@ class App:
 
     def close(self):
         self.stop_event.set()
+        self.root.after_cancel(self.drain_timer)
+        if self.cancel_page_confirmation is not None:
+            self.cancel_page_confirmation()
         self.root.destroy()
 
 
@@ -2424,6 +2688,9 @@ def portable_self_test(report_path):
         report["tk"] = root.tk.call("info", "patchlevel")
         report["dpi_aware"] = True
         report["calibration_next_to_app"] = Path(CALIB_FILE).parent == application_file().parent
+        report["current_version"] = app.version_row.get() == 0 and version_target({}, 0) is None
+        report["slider_direction"] = float(app.speed_scale.cget("from")) > float(app.speed_scale.cget("to"))
+        report["update_width"] = field_text_length("English", "version", "a" * 776) == (388, 1000)
         with tempfile.TemporaryDirectory(prefix="preview-autofill-selftest-") as temp:
             template = Path(temp) / "Template.xlsx"
             for english, language in ((False, "简体中文"), (True, "English")):
@@ -2434,6 +2701,9 @@ def portable_self_test(report_path):
             app.sheet.set(_xlsx_sheets(template)[0])
             app.preview()
             report["excel_update_row"] = app.update_text_row.get() == "16"
+            app.version_row.set(2)
+            app.refresh_workbook()
+            report["workbook_refresh"] = app.update_text_row.get() == "16" and app.version_row.get() == 2
             for lang in LANGS:
                 app.lang_vars[lang].set(lang == "English")
             for key, _ in FIELDS:
@@ -2450,7 +2720,9 @@ def portable_self_test(report_path):
         media_preset, _ = load_calibration("media.json")
         validate_media_calibration(media_preset, [("cover", 0, ""), ("image", 3, ""), ("video", 0, "")])
         report["built_in_presets"] = True
-        report["ok"] = all(report[k] for k in ("dpi_aware", "calibration_next_to_app", "template_roundtrip", "built_in_presets", "version_rows", "excel_update_row", "content_preview"))
+        report["ok"] = all(report[k] for k in ("dpi_aware", "calibration_next_to_app", "template_roundtrip",
+                                              "built_in_presets", "version_rows", "excel_update_row", "content_preview",
+                                              "current_version", "slider_direction", "update_width", "workbook_refresh"))
     except Exception as exc:
         report.update(ok=False, error=str(exc))
     finally:

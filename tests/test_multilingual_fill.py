@@ -3,6 +3,8 @@ import ctypes
 import importlib.util
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
@@ -223,6 +225,18 @@ class FillTests(unittest.TestCase):
 
 
 class DataTests(unittest.TestCase):
+    def test_field_lengths_use_code_points_and_update_width(self):
+        self.assertEqual(tool.field_text_length("English", "version", "a" * 776), (388, 1000))
+        self.assertEqual(tool.field_text_length("English", "version", "a" * 1953), (976.5, 1000))
+        self.assertEqual(tool.field_text_length("Tiếng Việt", "version", "é a\r\nb"), (2.5, 1000))
+        self.assertEqual(tool.field_text_length("Русский", "version", "я" * 1001), (1001, 1000))
+        for language in tool.LANGS:
+            text = " A B  " if language != "ภาษาไทย" else "ก้ก้ก้"
+            limit = 20 if language in tool.LATIN_LANGUAGES else 10
+            self.assertEqual(tool.field_text_length(language, "name", text), (6, limit))
+        self.assertEqual(tool.field_text_length("English", "notes", "a" * 201), (201, 200))
+        self.assertEqual(tool.field_text_length("English", "desc", "a" * 501), (501, 5000))
+
     def test_game_window_detection_uses_english_title_and_game_process(self):
         def detect(title, image):
             windows = {41: ("Genshin Impact", "browser.exe"), 42: (title, image)}
@@ -436,6 +450,14 @@ class DataTests(unittest.TestCase):
 
 
 class WizardTests(unittest.TestCase):
+    def wait_for(self, root, predicate):
+        deadline = time.monotonic() + 3
+        while not predicate():
+            root.update()
+            if time.monotonic() >= deadline:
+                self.fail('Timed out waiting for fill state')
+            time.sleep(.01)
+
     def test_excel_update_row_applies_on_preview_and_fill_without_mixing_rows(self):
         tool.enable_physical_pixels()
         root = tool.tk.Tk(); root.withdraw()
@@ -527,6 +549,35 @@ class WizardTests(unittest.TestCase):
                 app.update_text_row.set('')
                 self.assertIn('Older update', [cell[-1] for cell in app.current_plan()])
                 self.assertEqual(app.update_text_row.get(), '20')
+
+                # Excel saves new text while the tool is open. A refresh must
+                # keep row 20, not jump to the first populated update.
+                app.content.excluded.add(('English', 'name'))
+                saved = ' New update\nSecond line '
+                parts[xml_path] = parts[xml_path].replace(b'Older update', saved.encode('utf-8'))
+                with zipfile.ZipFile(workbook, 'w') as book:
+                    for member, content in parts.items():
+                        book.writestr(member, content)
+                app.busy = True
+                app.refresh_workbook()
+                self.assertEqual(app.content.texts['version']['English'], 'Older update')
+                app.busy = False
+                app.refresh_run_status()
+                app.refresh_button.invoke()
+                self.assertEqual(app.sheet.get(), '多语言')
+                self.assertEqual(app.update_text_row.get(), '20')
+                self.assertEqual(app.version_row.get(), 4)
+                self.assertEqual(app.content.texts['version']['English'], saved)
+                self.assertEqual(app.content.texts['name']['简体中文'], '示例关卡')
+                self.assertIn(('English', 'name'), app.content.excluded)
+
+                previous = app.content
+                workbook.write_bytes(b'workbook is being saved')
+                with patch.object(app, 'error') as error:
+                    app.refresh_button.invoke()
+                    error.assert_called_once()
+                self.assertIs(app.content, previous)
+                self.assertEqual(app.update_text_row.get(), '20')
         finally:
             app.close()
 
@@ -572,7 +623,13 @@ class WizardTests(unittest.TestCase):
             app.field_vars['version'].set(True)
             panel = tool.ContentPreview(app)
             panel.editor.delete('1.0', 'end'); panel.editor.insert('1.0', '取消的修改')
-            panel.commit(); panel.window.destroy()
+            panel.commit()
+            root.update()
+            panel.editor.focus_force()
+            panel.editor.event_generate('<Escape>')
+            root.update()
+            self.assertFalse(panel.window.winfo_exists())
+            self.assertIsNone(root.grab_current())
             self.assertEqual(app.current_plan()[0][-1], '原始名称')
             panel = tool.ContentPreview(app)
             panel.editor.delete('1.0', 'end'); panel.editor.insert('1.0', '本次名称')
@@ -585,8 +642,129 @@ class WizardTests(unittest.TestCase):
             self.assertEqual(original['name']['简体中文'], '原始名称')
             self.assertEqual(original['version']['简体中文'], 'v1\n含 空格')
             app.ui_language.set('English'); app.translate_ui()
-            self.assertEqual(app.version_row.get(), 1)
-            self.assertEqual(app.version_box.get(), 'Dropdown row 1')
+            self.assertEqual(app.version_row.get(), 0)
+            self.assertEqual(app.version_box.get(), 'Current version')
+            self.assertEqual(app.version_box['values'][:2], ('Current version', 'Dropdown row 2'))
+        finally:
+            app.close()
+
+    def test_over_limit_name_and_update_are_reported_before_game_access(self):
+        tool.enable_physical_pixels()
+        root = tool.tk.Tk(); root.withdraw()
+        app = tool.App(root)
+        try:
+            plan = [
+                (0, "简体中文", "name", "关卡名称", "中" * 10 + " "),
+                (2, "English", "version", "版本更新记录", "a" * 2001),
+            ]
+            with patch.object(app, 'current_plan', return_value=plan), \
+                 patch.object(app, 'game') as game, patch.object(app, 'error') as error:
+                app.fill()
+            game.assert_not_called()
+            self.assertIn('11/10', str(error.call_args.args[0]))
+            self.assertIn('1000.5/1000', str(error.call_args.args[0]))
+        finally:
+            app.close()
+
+    def test_right_aligned_confirmation_centers_pointer_and_f9_dismisses(self):
+        tool.enable_physical_pixels()
+        root = tool.tk.Tk()
+        app = tool.App(root)
+        try:
+            root.update_idletasks()
+            game = tool.user32.GetAncestor(root.winfo_id(), 2)
+            reply, event = {}, threading.Event()
+            app.busy = True
+            with patch.object(tool, 'move_to') as move:
+                app.show_page_confirmation(game, 'bottom', tool.stage_language_order('English'), reply, event)
+                self.wait_for(root, lambda: move.called)
+            root.update_idletasks()
+            window = root.children['page_confirmation']
+            hwnd = tool.user32.GetAncestor(window.winfo_id(), 2)
+            rect = tool.wintypes.RECT()
+            self.assertTrue(tool.user32.GetWindowRect(hwnd, ctypes.byref(rect)))
+            info = tool.MONITORINFO(cbSize=ctypes.sizeof(tool.MONITORINFO))
+            monitor = tool.user32.MonitorFromWindow(game, 2)
+            self.assertTrue(tool.user32.GetMonitorInfoW(monitor, ctypes.byref(info)))
+            self.assertEqual(info.rcWork.right - rect.right, 12)
+            self.assertGreaterEqual(rect.left, info.rcWork.left)
+            self.assertIsNone(root.grab_current())
+            self.assertTrue(window.attributes('-topmost'))
+            buttons = window.winfo_children()[0].winfo_children()[-1].winfo_children()
+            confirm = next(button for button in buttons if button.cget('text') == '确定')
+            move.assert_called_once_with(confirm.winfo_rootx() + confirm.winfo_width() / 2,
+                                         confirm.winfo_rooty() + confirm.winfo_height() / 2)
+            self.assertFalse(event.is_set())  # Moving the pointer never confirms.
+            with patch.object(tool.user32, 'GetAsyncKeyState', side_effect=lambda key: 0x8000 if key == 0x78 else 0):
+                self.wait_for(root, event.is_set)
+            self.assertTrue(event.is_set())
+            self.assertFalse(reply['ok'])
+            self.assertFalse(window.winfo_exists())
+            app.stop_event.clear()
+            with patch.object(tool, 'move_to') as move:
+                app.show_page_confirmation(game, 'top', tool.stage_language_order('English'), {}, threading.Event())
+                app.cancel_page_confirmation()
+                settled = threading.Event()
+                root.after(60, settled.set)
+                self.wait_for(root, settled.is_set)
+                move.assert_not_called()
+        finally:
+            app.close()
+
+    def test_f8_finishes_current_cell_then_resumes_once_or_stops_with_f9(self):
+        tool.enable_physical_pixels()
+        root = tool.tk.Tk(); root.withdraw()
+        app = tool.App(root)
+        pressed = set()
+        written = []
+        keys = []
+        actual_pause = tool.pause
+
+        def write(text, should_stop, owner):
+            written.append(text)
+            if len(written) == 1:
+                pressed.add(0x77)
+                if not app.pause_requested.wait(2):
+                    raise AssertionError('F8 was not received')
+
+        try:
+            app.path.set('fixture.xlsx')
+            app.sheet.set('Stage')
+            app.content_source = ('fixture.xlsx', 'Stage')
+            app.content = tool.ContentSelection({'name': {'简体中文': '名称'}, 'notes': {'简体中文': '玩法'}})
+            self.assertGreater(float(app.speed_scale.cget('from')), float(app.speed_scale.cget('to')))
+            with patch.object(app, 'game', return_value=42), \
+                 patch.object(app, 'log_geometry', return_value=(962, 564)), \
+                 patch.object(tool, 'load_text_calibration', return_value=(calibration(), False)), \
+                 patch.object(tool.user32, 'GetAsyncKeyState', side_effect=lambda key: 0x8000 if key in pressed else 0), \
+                 patch.object(tool.user32, 'SetForegroundWindow', return_value=True), \
+                 patch.object(tool.user32, 'GetForegroundWindow', return_value=42), \
+                 patch.object(tool, 'move_to'), patch.object(tool, 'click'), patch.object(tool, 'scroll_notch'), \
+                 patch.object(tool, 'screen_point', side_effect=lambda point, hwnd: point), \
+                 patch.object(tool, 'combo', side_effect=lambda *args: keys.append(args)), \
+                 patch.object(tool, 'set_clipboard', side_effect=write), \
+                 patch.object(tool, 'pause', side_effect=lambda delay, stop: actual_pause(min(delay, .01), stop)), \
+                 patch.object(app, 'show_page_confirmation', side_effect=lambda hwnd, page, order, reply, event:
+                              (reply.update(ok=True), event.set())):
+                for stop_while_paused in (False, True):
+                    written.clear()
+                    keys.clear()
+                    app.fill()
+                    self.wait_for(root, lambda: app.fill_status.get() == '已暂停')
+                    self.assertEqual(written, ['名称'])
+                    self.assertIn(('enter',), keys)
+                    self.assertTrue(app.refresh_button.instate(['disabled']))
+                    held = threading.Event()
+                    root.after(75, held.set)
+                    self.wait_for(root, held.is_set)
+                    self.assertTrue(app.fill_paused.is_set())  # holding F8 does not resume
+                    pressed.clear()
+                    self.wait_for(root, lambda: not app.pause_key_down)
+                    pressed.add(0x78 if stop_while_paused else 0x77)
+                    self.wait_for(root, lambda: not app.busy)
+                    self.assertEqual(written, ['名称'] if stop_while_paused else ['名称', '玩法'])
+                    pressed.clear()
+                    self.wait_for(root, lambda: not app.pause_key_down)
         finally:
             app.close()
 

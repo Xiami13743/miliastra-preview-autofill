@@ -54,7 +54,7 @@ def main():
         '请保留 _internal 文件夹，不能只复制 exe。\n'
         '程序内置 v0.3.6 的文字和媒体坐标，可先核对位置。\n'
         '校准文件保存在 exe 旁边。更新前请保留自己的 calib JSON 文件。\n'
-        '完整步骤见 README.md。F9 随时停止，游戏最终“提交”由你手动点击。\n\n'
+        '完整步骤见 README.md。文字填写按 F8 暂停或继续，F9 停止。游戏最终“提交”由你手动点击。\n\n'
         'English setup guide: README.en.md\n', encoding='utf-8-sig')
     authorized_calibration = set()
     if args.calibration_dir:
